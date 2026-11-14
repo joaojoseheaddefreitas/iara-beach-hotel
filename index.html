@@ -24989,18 +24989,99 @@ function cardapioIr(d,manual){
   C.pag=(C.pag+d+nPag())%nPag();if(manual)C.pausa=Date.now()+14000;cardapioRender(true);
 }
 
-var HI=0;
+var HI=0,HSIG='';
+function achar(id){var cs=cats();for(var a=0;a<cs.length;a++){var its=cs[a].itens||[];for(var b=0;b<its.length;b++)if(its[b].id===id)return {i:its[b],c:cs[a]}}return null}
+function okFoto(f){return !!f&&!/sem-foto/.test(f)}
+var FRASE={bebidas:'Refresque o seu dia',petiscos:'Pra beliscar de frente pro mar',entradas:'Pra abrir o apetite',pratos:'Sabor que conquista',sobremesas:'Termine com doçura'};
+/* Slides do topo: prato do dia / promoções / eventos (os mesmos do banner do cliente, vindos do Admin)
+   + vitrine por categoria (entradas, pratos, bebidas, sobremesas) com foto e preço reais do cardápio. */
+function heroSlides(){
+  var cfg=(typeof config!=='undefined'&&config)||{},out=[],usados={},A=cfg.totemUsaAvisos===false?[]:((window.CC_ADS&&window.CC_ADS.slides)||[]);
+  (cfg.totemSlides||[]).forEach(function(x){if(!x||x.ativo===false||(!x.tit&&!x.foto))return;out.push({tag:x.tag||'',tit:x.tit||'',sub:x.sub||'',foto:x.foto||'',prod:false})});
+  A.forEach(function(x){
+    var ref=x.itemId?achar(x.itemId):null;
+    if(x.itemId&&(!ref||ref.i.ativo===false||ref.i.esgotado===true))return;
+    if(!x.itemId&&!x.livre&&x.cat&&!cats().some(function(c){return c.id===x.cat}))return;
+    var fr=x.fotoDe?achar(x.fotoDe):ref,foto=x.foto||(fr&&fr.i.img)||'';if(!okFoto(foto))foto='';
+    var sub=String(x.sub||'');if(ref)sub=sub.replace('{preco}',brl(preco(ref.i)));
+    if(ref)usados[ref.i.id]=1;
+    out.push({tag:x.tag||'Destaque',tit:x.titulo||(ref&&ref.i.nome)||'',sub:sub,foto:foto,emoji:x.emoji,prod:x.fotoModo==='produto'});
+  });
+  var cs=cats().map(function(c){
+    var its=(c.itens||[]).filter(function(i){return elegivel(i)&&okFoto(i.img)}).sort(function(p,q){return (q.novo?1:0)-(p.novo?1:0)});
+    return {c:c,its:its}}).filter(function(x){return x.its.length});
+  for(var k=0;k<(cfg.totemUsaCategorias===false?0:2);k++)cs.forEach(function(x){
+    var it=x.its[k];if(!it||usados[it.id])return;usados[it.id]=1;
+    var fr=FRASE[x.c.id]||'Peça pelo QR Code';
+    out.push({tag:it.novo?'✨ Novidade':((x.c.icone||'')+' '+x.c.nome).trim(),tit:it.nome,sub:brl(preco(it))+' · '+fr,foto:it.img,emoji:x.c.icone,prod:false});
+  });
+  if(out.length>14)out=out.slice(0,14);
+  if(!out.length)(window.IARA_FOTOS||[]).forEach(function(f){out.push({tag:'',tit:'',sub:'',foto:f.u,pos:f.p})});
+  return out;
+}
 function heroMonta(v){
-  var h=$('#tmc-hero',v),fs=window.IARA_FOTOS||[];if(!h)return;
-  if(!fs.length){h.style.display='none';return}
-  if(h.children.length)return;
-  h.innerHTML=fs.map(function(f,k){return '<img class="'+(k?'':'on')+'" src="'+f.u+'" alt="" style="object-position:'+f.p+'">'}).join('');HI=0;
+  var h=$('#tmc-hero',v);if(!h)return;
+  var L=heroSlides(),sig=L.map(function(x){return x.tit+'|'+(x.foto?x.foto.length:0)}).join('~');
+  if(!L.length){h.style.display='none';return}
+  h.style.display='';if(sig===HSIG&&h.children.length)return;HSIG=sig;
+  h.innerHTML=L.map(function(x,k){
+    var img=x.foto?(x.prod?'<span class="pr"><img src="'+esc(x.foto)+'" alt=""></span>':'<img class="ph" src="'+esc(x.foto)+'" alt="" style="object-position:'+esc(x.pos||'center')+'">'):(x.emoji?'<span class="emo">'+esc(x.emoji)+'</span>':'');
+    return '<div class="tm-sl'+(k===0?' on':'')+'">'+img+(x.tit?'<div class="shade"></div><div class="cap">'+(x.tag?'<span class="tag">'+esc(x.tag)+'</span>':'')+'<div class="tt">'+esc(x.tit)+'</div>'+(x.sub?'<div class="sb">'+esc(x.sub)+'</div>':'')+'</div>':'')+'</div>';
+  }).join('')+(L.length>1?'<div class="hd">'+L.map(function(_,k){return '<i'+(k===0?' class="on"':'')+'></i>'}).join('')+'</div>':'');
+  HI=0;
 }
 function heroTick(){
   var v=$('#view-totem-cardapio');if(!visivel(v)||reduz)return;
-  var im=$$('#tmc-hero img',v);if(im.length<2)return;
-  HI=(HI+1)%im.length;im.forEach(function(x,k){x.classList.toggle('on',k===HI)});
+  var sl=$$('#tmc-hero .tm-sl',v);if(sl.length<2)return;
+  HI=(HI+1)%sl.length;sl.forEach(function(x,k){x.classList.toggle('on',k===HI)});
+  $$('#tmc-hero .hd i',v).forEach(function(x,k){x.classList.toggle('on',k===HI)});
 }
+/* ═════════════════ ADMIN: destaques do topo do Totem Cardápio ═════════════════ */
+function cfgT(){try{if(typeof config==='undefined'||!config)return null;if(!Array.isArray(config.totemSlides))config.totemSlides=[];return config}catch(e){return null}}
+var tmTimer=null;
+function tmSalva(imediato){
+  var go=function(){try{if(typeof salvar==='function')salvar('config',config);else localStorage.setItem('solbahia_config',JSON.stringify(config))}catch(e){}
+    HSIG='';var v=$('#view-totem-cardapio');if(v&&$('#tmc-frame',v))heroMonta(v)};
+  clearTimeout(tmTimer);if(imediato)go();else tmTimer=setTimeout(go,600);
+}
+function tmImg(f,cb){var r=new FileReader();r.onload=function(){var im=new Image();im.onload=function(){var k=Math.min(1,1000/Math.max(im.width,im.height)),c=document.createElement('canvas');c.width=Math.round(im.width*k);c.height=Math.round(im.height*k);c.getContext('2d').drawImage(im,0,0,c.width,c.height);cb(c.toDataURL('image/jpeg',.74))};im.src=r.result};r.readAsDataURL(f)}
+function tmAdmDesenha(){
+  var box=document.getElementById('cc-tmadm'),c=cfgT();if(!box||!c)return;
+  var L=c.totemSlides;
+  box.innerHTML='<h3 style="font-weight:900;font-size:1rem;color:#0f2340;margin:0 0 4px">📺 Totem Cardápio · Destaques do topo</h3>'+
+  '<p class="tmad-p">Faixa que gira no topo do Totem: pratos do dia, promoções e especialidades. Cadastre aqui e aparece na hora no totem.</p>'+
+  '<label class="tmad-ck"><input type="checkbox" data-opt="totemUsaAvisos"'+(c.totemUsaAvisos===false?'':' checked')+'> Incluir Prato do Dia / Promoções / Eventos (cartão "Avisos do banner")</label>'+
+  '<label class="tmad-ck"><input type="checkbox" data-opt="totemUsaCategorias"'+(c.totemUsaCategorias===false?'':' checked')+'> Incluir vitrine automática de Entradas, Pratos, Bebidas e Sobremesas (foto e preço do cardápio)</label>'+
+  L.map(function(x,i){return '<div class="tmad-row"><div class="tmad-th" data-foto-btn="'+i+'">'+(x.foto?'<img src="'+esc(x.foto)+'" alt="">':'<span>📷<br>Foto</span>')+'</div>'+
+    '<div class="tmad-f"><input data-f="tag" data-i="'+i+'" placeholder="Etiqueta (ex.: Prato do Dia, Promoção)" value="'+esc(x.tag||'')+'">'+
+    '<input data-f="tit" data-i="'+i+'" placeholder="Título (ex.: Moqueca de Camarão)" value="'+esc(x.tit||'')+'">'+
+    '<input data-f="sub" data-i="'+i+'" placeholder="Frase/preço (ex.: R$ 89,90 · serve 2 pessoas)" value="'+esc(x.sub||'')+'">'+
+    '<div class="tmad-a"><label><input type="checkbox" data-ativo="'+i+'"'+(x.ativo===false?'':' checked')+'> Ativo</label>'+
+    '<button type="button" data-act="up" data-i="'+i+'">↑</button><button type="button" data-act="dn" data-i="'+i+'">↓</button><button type="button" data-act="del" data-i="'+i+'">🗑 Remover</button></div></div>'+
+    '<input type="file" accept="image/*" data-foto="'+i+'" style="display:none"></div>'}).join('')+
+  '<button type="button" class="tmad-add" data-act="add">＋ Novo destaque</button>';
+}
+function tmAdm(){
+  var v=document.getElementById('view-admin');if(!v||!cfgT())return;
+  var box=document.getElementById('cc-tmadm');
+  if(box){if(box.parentNode!==v)v.appendChild(box);return}
+  box=document.createElement('div');box.id='cc-tmadm';box.className='admin-card mb-4';v.appendChild(box);tmAdmDesenha();
+  box.addEventListener('input',function(e){var t=e.target,c=cfgT();if(!c||!t.dataset||t.dataset.f===undefined)return;c.totemSlides[+t.dataset.i][t.dataset.f]=t.value;tmSalva()});
+  box.addEventListener('change',function(e){var t=e.target,c=cfgT();if(!c||!t.dataset)return;
+    if(t.dataset.opt){c[t.dataset.opt]=t.checked;tmSalva(true)}
+    else if(t.dataset.ativo!==undefined){c.totemSlides[+t.dataset.ativo].ativo=t.checked;tmSalva(true)}
+    else if(t.dataset.foto!==undefined&&t.files&&t.files[0]){var i=+t.dataset.foto;tmImg(t.files[0],function(u){c.totemSlides[i].foto=u;tmSalva(true);tmAdmDesenha()})}});
+  box.addEventListener('click',function(e){var c=cfgT(),t=e.target;if(!c)return;
+    var th=t.closest&&t.closest('[data-foto-btn]');if(th){var fi=box.querySelector('input[data-foto="'+th.getAttribute('data-foto-btn')+'"]');if(fi)fi.click();return}
+    var b=t.closest&&t.closest('button[data-act]');if(!b)return;var a=b.dataset.act,i=+b.dataset.i,L=c.totemSlides;
+    if(a==='add'){if(L.length>=10){alert('Máximo de 10 destaques.');return}L.push({tag:'',tit:'',sub:'',foto:'',ativo:true})}
+    else if(a==='del'){if(confirm('Remover este destaque?'))L.splice(i,1);else return}
+    else if(a==='up'&&i>0){var x=L[i];L[i]=L[i-1];L[i-1]=x}
+    else if(a==='dn'&&i<L.length-1){var y=L[i];L[i]=L[i+1];L[i+1]=y}
+    tmSalva(true);tmAdmDesenha()});
+}
+setInterval(tmAdm,2000);document.addEventListener('DOMContentLoaded',tmAdm);window.addEventListener('cc:nuvem-pronta',function(){var b=document.getElementById('cc-tmadm');if(b)tmAdmDesenha()});
+
 /* ═════════════════ TOTEM HOTELARIA ═════════════════ */
 var LG={it:'🇮🇹',pt:'🇧🇷',en:'🇺🇸',es:'🇪🇸'},H={lang:'pt',sig:'',foto:0,pausa:0};
 var U={
@@ -25097,7 +25178,7 @@ setInterval(function(){
   }
 },8000);
 setInterval(hotelTick,4000);
-setInterval(heroTick,4000);
+setInterval(heroTick,5500);
 function boot(){tiles();new MutationObserver(tiles).observe(document.body,{childList:true,subtree:true})}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot);else boot();
 })();
@@ -25190,3 +25271,37 @@ body.cc-modo-cliente #cc-promo-carousel .promo-card{flex:0 0 calc((100% - var(--
  if(!w||!c||!c.parentNode)return false;if(c.nextElementSibling!==w)c.parentNode.insertBefore(w,c.nextSibling);return true}
  [300,1200,2500,5000].forEach(function(t){setTimeout(ok,t)});window.addEventListener('load',ok);})();
 </script>
+<style id="cc-totem-hero-css">
+/* Topo do Totem Cardápio: vitrine rotativa (prato do dia, promoções, categorias) */
+#view-totem-cardapio .tm-hero{aspect-ratio:16/10;border-radius:14px;box-shadow:0 10px 28px rgba(0,0,0,.45)}
+#view-totem-cardapio .tm-hero .tm-sl{position:absolute;inset:0;opacity:0;transition:opacity 1s ease}
+#view-totem-cardapio .tm-hero .tm-sl.on{opacity:1;z-index:1}
+#view-totem-cardapio .tm-hero .tm-sl img.ph{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:1;transition:none;transform:scale(1.02)}
+#view-totem-cardapio .tm-hero .tm-sl.on img.ph{animation:tmkb 7s ease-out forwards}
+@keyframes tmkb{to{transform:scale(1.12)}}
+#view-totem-cardapio .tm-sl .shade{position:absolute;inset:0;background:linear-gradient(180deg,rgba(4,24,15,.15) 0%,rgba(4,24,15,0) 35%,rgba(4,24,15,.92) 100%)}
+#view-totem-cardapio .tm-sl .cap{position:absolute;left:14px;right:14px;bottom:14px;z-index:2}
+#view-totem-cardapio .tm-sl .tag{display:inline-block;background:#d4af37;color:#04180f;font:800 .66rem system-ui,sans-serif;letter-spacing:.09em;text-transform:uppercase;padding:4px 11px;border-radius:999px}
+#view-totem-cardapio .tm-sl .tt{color:#fff;font-size:clamp(1.2rem,5vw,1.8rem);line-height:1.1;margin:7px 0 3px;text-shadow:0 2px 10px rgba(0,0,0,.8)}
+#view-totem-cardapio .tm-sl .sb{color:#f4d77a;font:700 .82rem system-ui,sans-serif;text-shadow:0 1px 6px rgba(0,0,0,.8)}
+#view-totem-cardapio .tm-sl .pr{position:absolute;right:14px;top:14px;width:34%;aspect-ratio:1;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;padding:10px;box-sizing:border-box;box-shadow:0 8px 22px rgba(0,0,0,.45)}
+#view-totem-cardapio .tm-hero .tm-sl .pr img{position:static;width:auto;height:auto;max-width:100%;max-height:100%;object-fit:contain;opacity:1;transition:none}
+#view-totem-cardapio .tm-sl .emo{position:absolute;right:18px;top:18px;font-size:4.5rem;opacity:.9}
+#view-totem-cardapio .tm-hero .hd{position:absolute;top:10px;left:12px;z-index:3;display:flex;gap:4px}
+#view-totem-cardapio .tm-hero .hd i{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.45)}
+#view-totem-cardapio .tm-hero .hd i.on{width:16px;border-radius:4px;background:#d4af37}
+@media(prefers-reduced-motion:reduce){#view-totem-cardapio .tm-hero .tm-sl.on img.ph{animation:none}}
+</style>
+<style id="cc-totem-admin-css">
+#cc-tmadm{margin:12px 0;padding:14px;background:#fff;border:1px solid #e5e7eb;border-radius:16px}
+#cc-tmadm .tmad-p{font-size:.75rem;color:#6b7280;margin:0 0 10px}
+#cc-tmadm .tmad-ck{display:flex;gap:8px;align-items:flex-start;font-size:.78rem;color:#1f2937;margin:6px 0}
+#cc-tmadm .tmad-row{display:flex;gap:10px;padding:10px;border:1px solid #e5e7eb;border-radius:12px;margin-top:10px;background:#f9fafb}
+#cc-tmadm .tmad-th{flex:0 0 84px;height:84px;border-radius:10px;background:#e5e7eb;overflow:hidden;display:flex;align-items:center;justify-content:center;text-align:center;font-size:.7rem;color:#6b7280;cursor:pointer}
+#cc-tmadm .tmad-th img{width:100%;height:100%;object-fit:cover}
+#cc-tmadm .tmad-f{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
+#cc-tmadm .tmad-f input[type=text],#cc-tmadm .tmad-f input:not([type]){width:100%;border:1px solid #d1d5db;border-radius:8px;padding:7px 9px;font-size:.8rem;background:#fff;color:#111}
+#cc-tmadm .tmad-a{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:.74rem}
+#cc-tmadm .tmad-a button{border:1px solid #d1d5db;background:#fff;border-radius:8px;padding:5px 9px;font-size:.74rem;cursor:pointer}
+#cc-tmadm .tmad-add{margin-top:12px;width:100%;padding:11px;border:0;border-radius:12px;background:#0f2340;color:#fff;font-weight:800;font-size:.85rem;cursor:pointer}
+</style>
