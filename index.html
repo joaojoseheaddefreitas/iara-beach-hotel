@@ -25104,3 +25104,31 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 </script>
 
 </body></html>
+
+<style id="cc-promo-larga">
+/* faixa de promoções um pouco mais larga (alinha com a busca) */
+body.cc-modo-cliente:not(.cc-cardapio-full) #cc-cat-nav-wrap #cc-ads-banner{margin:12px -6px 0!important;width:auto!important}
+</style>
+<script id="cc-fotos-categoria-nuvem">
+/* Fotos das categorias (ex.: coco na praia em Bebidas) ficam em config.categoriaFotos na nuvem.
+   Se este aparelho ainda não tem, busca SÓ essa chave (nada de Pix/tokens) e redesenha as categorias. */
+(function(){
+  var feito=false;
+  function tentar(){
+    if(feito)return;
+    try{
+      if(typeof config==='undefined'||!config||(config.categoriaFotos&&Object.keys(config.categoriaFotos).length))return;
+      if(typeof ccGetSupabaseClient!=='function')return;
+      var sb=ccGetSupabaseClient();if(!sb)return;feito=true;
+      var emp=window.COOKCONTROL_EMPRESA_ID_ATIVA;
+      sb.from('config_estabelecimento').select('dados').eq('chave',emp+':config').maybeSingle().then(function(r){
+        var f=r&&r.data&&r.data.dados&&r.data.dados.categoriaFotos;
+        if(f&&Object.keys(f).length){config.categoriaFotos=f;if(typeof renderNav==='function')renderNav()}
+        else feito=false;
+      }).catch(function(){feito=false});
+    }catch(e){}
+  }
+  [2500,6000,12000,25000].forEach(function(t){setTimeout(tentar,t)});
+  window.addEventListener('cc:nuvem-pronta',function(){setTimeout(tentar,500)});
+})();
+</script>
