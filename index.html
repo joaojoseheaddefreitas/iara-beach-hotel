@@ -25105,9 +25105,61 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 
 </body></html>
 
-<style id="cc-promo-larga">
-/* faixa de promoções um pouco mais larga (alinha com a busca) */
-body.cc-modo-cliente:not(.cc-cardapio-full) #cc-cat-nav-wrap #cc-ads-banner{margin:12px -6px 0!important;width:auto!important}
+<style id="cc-mobile-layout-final">
+/* ═══ AJUSTE MOBILE-FIRST FINAL — cardápio do cliente (360–430px) ═══
+   Último bloco do arquivo: só reposiciona/dimensiona, não muda lógica. */
+:root{--cc-gap:8px;--cc-edge:6px}
+
+/* 1) Hero equilibrado: 220–260px (32vh), gradiente escuro na base p/ contraste */
+body.cc-modo-cliente #cc-topo-banner-btn{height:clamp(220px,32vh,260px)!important;min-height:0!important;max-height:260px!important}
+body.cc-modo-cliente #cc-topo-banner-btn::after{content:"";position:absolute;inset:0;pointer-events:none;z-index:1;
+  background:linear-gradient(180deg,rgba(8,20,38,.35) 0%,rgba(8,20,38,0) 34%,rgba(8,20,38,.80) 100%)}
+body.cc-modo-cliente #cc-topo-banner-btn>*:not(.cc-topo-logo):not([class*="cc-bn-rot"]):not(#cc-topo-banner-img):not(#cc-topo-banner-3fotos){position:relative;z-index:2}
+
+/* 2) Barra superior sem sobreposição: [Voltar]  ........  [selo][bandeiras]
+      tudo na mesma linha (top:8px), selo ao lado da pílula de bandeiras */
+#cc-lang-bar{top:8px!important;right:var(--cc-edge)!important}
+body.cc-modo-cliente #cc-btn-voltar-painel{top:8px!important;left:var(--cc-edge)!important;height:32px!important;
+  padding:0 12px!important;font-size:.74rem!important;line-height:32px!important;border-radius:999px!important;white-space:nowrap!important}
+#cc-topo-banner-btn .cc-topo-logo{top:4px!important;right:calc(var(--cc-edge) + 124px)!important;width:40px!important;height:40px!important;border-width:2px!important}
+@media(min-width:641px){#cc-topo-banner-btn .cc-topo-logo{right:156px!important}}
+
+/* 3) Busca + mesa: alvo de toque 46px */
+body.cc-modo-cliente #search-input,body.cc-modo-cliente #cc-ident-input-cliente{height:46px!important;min-height:46px!important;padding-top:0!important;padding-bottom:0!important}
+
+/* 4) Categorias: grid 4 colunas idêntico, cards quadrados, rótulo sempre com altura de 2 linhas */
+body.cc-modo-cliente:not(.cc-cardapio-full) #conteudo-secao-mesa #cat-nav{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:var(--cc-gap)!important;
+  padding:0 var(--cc-edge)!important;overflow:visible!important;align-items:stretch!important}
+body.cc-modo-cliente:not(.cc-cardapio-full) #conteudo-secao-mesa #cat-nav .cat-photo-card{width:auto!important;min-width:0!important;height:auto!important;min-height:0!important;max-height:none!important;
+  aspect-ratio:1/1!important;margin:0!important;padding:0 3px 7px!important;display:flex!important;align-items:flex-end!important;justify-content:center!important;
+  background-size:cover!important;background-position:center!important;border-radius:16px!important;box-sizing:border-box!important}
+body.cc-modo-cliente:not(.cc-cardapio-full) #conteudo-secao-mesa #cat-nav .cat-photo-label{display:flex!important;align-items:center!important;justify-content:center!important;
+  width:100%!important;min-height:2.3em!important;text-align:center!important;font-size:clamp(.56rem,2.6vw,.7rem)!important;line-height:1.12!important;letter-spacing:.02em!important;
+  overflow-wrap:normal!important;word-break:normal!important;hyphens:none!important}
+
+/* 5) Promoção compacta; foto do produto em círculo ajustado (sem caixa branca gigante) */
+body.cc-modo-cliente:not(.cc-cardapio-full) #cc-cat-nav-wrap #cc-ads-banner{margin:10px var(--cc-edge) 0!important;width:auto!important;height:clamp(104px,14.5vh,118px)!important;border-radius:18px!important}
+body.cc-modo-cliente #cc-ads-banner .cc-ads-prod{top:50%!important;bottom:auto!important;right:14px!important;width:78px!important;height:78px!important;transform:translateY(-50%)!important;
+  border-radius:50%!important;border:0!important;background-size:contain!important;background-origin:content-box!important;padding:7px!important;box-sizing:border-box!important;box-shadow:0 4px 14px rgba(0,0,0,.35)!important}
+body.cc-modo-cliente #cc-ads-banner .cc-ads-texto{padding:10px 12px!important;gap:3px!important;max-width:66%!important}
+body.cc-modo-cliente #cc-ads-banner .cc-ads-titulo{font-size:1rem!important}
+body.cc-modo-cliente #cc-ads-banner .cc-ads-cta{margin-top:2px!important;padding:6px 14px!important}
+
+/* 6) Sem espaço morto: some o pb-36/min-h-screen, deixa só o necessário p/ a barra inferior */
+body.cc-modo-cliente #conteudo-secao-mesa{min-height:0!important;padding-bottom:calc(76px + env(safe-area-inset-bottom,0px))!important}
+body.cc-modo-cliente #view-cardapio,body.cc-modo-cliente #view-mesa-cliente{padding-bottom:0!important}
+body.cc-modo-cliente #cc-cat-nav-wrap{margin-bottom:0!important}
+body.cc-modo-cliente #cc-promo-carousel-wrap{margin-bottom:8px!important}
+/* zera os deslocamentos antigos (top:-X / +Y) que faziam o grid invadir a faixa de promoção */
+body.cc-modo-cliente:not(.cc-cardapio-full) #cc-cat-nav-wrap{top:0!important;margin-top:8px!important}
+body.cc-modo-cliente:not(.cc-cardapio-full) #cc-cat-nav-wrap #cat-nav{top:0!important;height:auto!important;min-height:0!important;max-height:none!important}
+html,body{overflow-x:hidden}
+/* 7) "Destaques" volta a aparecer ABAIXO da faixa de promoção, em carrossel horizontal compacto (preenche a primeira dobra) */
+body.cc-modo-cliente:not(.cc-cardapio-full) #cc-promo-carousel-wrap:not([style*="display: none"]){display:block!important;padding:0 var(--cc-edge)!important;margin:10px 0 0!important;max-width:none!important}
+body.cc-modo-cliente #cc-promo-carousel-wrap>p{text-align:left!important;margin:0 2px 6px!important;font-size:.8rem!important;font-weight:800!important}
+body.cc-modo-cliente #cc-promo-carousel{display:flex!important;gap:var(--cc-gap)!important;overflow-x:auto!important;scroll-snap-type:none;padding:0 0 4px!important;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+body.cc-modo-cliente #cc-promo-carousel::-webkit-scrollbar{display:none}
+body.cc-modo-cliente #cc-promo-carousel .promo-card{flex:0 0 calc((100% - var(--cc-gap))/2.4)!important;width:auto!important;height:112px!important;border-radius:16px!important}
 </style>
 <script id="cc-fotos-categoria-nuvem">
 /* Fotos das categorias (ex.: coco na praia em Bebidas) ficam em config.categoriaFotos na nuvem.
@@ -25131,4 +25183,10 @@ body.cc-modo-cliente:not(.cc-cardapio-full) #cc-cat-nav-wrap #cc-ads-banner{marg
   [2500,6000,12000,25000].forEach(function(t){setTimeout(tentar,t)});
   window.addEventListener('cc:nuvem-pronta',function(){setTimeout(tentar,500)});
 })();
+</script>
+<script id="cc-ordem-destaques">
+/* coloca "Destaques" logo depois das categorias/promoção (uma vez; sem laço) */
+(function(){function ok(){var w=document.getElementById('cc-promo-carousel-wrap'),c=document.getElementById('cc-cat-nav-wrap');
+ if(!w||!c||!c.parentNode)return false;if(c.nextElementSibling!==w)c.parentNode.insertBefore(w,c.nextSibling);return true}
+ [300,1200,2500,5000].forEach(function(t){setTimeout(ok,t)});window.addEventListener('load',ok);})();
 </script>
