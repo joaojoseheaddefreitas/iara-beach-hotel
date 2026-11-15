@@ -25703,3 +25703,24 @@ body.cc-modo-cliente #cc-btn-voltar-painel,#cc-btn-voltar-painel{top:calc(env(sa
 #cc-topo-banner-btn .cc-topo-logo{top:4px!important}
 #cc-nav-publica{padding-bottom:env(safe-area-inset-bottom,0px)}
 </style>
+
+<style id="cc-ajuste-banner-capa-iara-topo-altura-largura">
+/* AJUSTE PONTUAL — banner principal da capa (só apresentação, celular/tablet).
+   1) Desce o conjunto todo (foto, logo, bandeiras, textos) abaixo da barra de status
+      do iPhone, com uma margem, para o logo redondo aparecer inteiro.
+   2) Banner mais alto, com mais presença.
+   3) Mesma largura (e mesmas bordas laterais) da grade de abas logo abaixo.
+   Para afinar, mude só as 3 variáveis abaixo. */
+:root{--cc-capa-topo-margem:14px;--cc-capa-banner-altura:290px}
+@media(max-width:1023px){
+  html body #ab-clean-home#ab-clean-home{padding-top:calc(env(safe-area-inset-top,0px) + var(--cc-capa-topo-margem))!important;box-sizing:border-box!important}
+  html body #ab-clean-home#ab-clean-home .abch-hero.abch-hero{
+    /* largura = área útil da grade de abas (largura da grade menos o respiro lateral de 14px de cada lado) */
+    width:calc(min(900px, 100% - 24px) - 28px)!important;max-width:none!important;
+    margin-left:auto!important;margin-right:auto!important;
+    height:var(--cc-capa-banner-altura)!important;min-height:var(--cc-capa-banner-altura)!important;max-height:none!important;
+    aspect-ratio:auto!important;padding-bottom:0!important;box-sizing:border-box!important;
+    border-radius:18px!important;overflow:hidden!important;
+  }
+}
+</style>
