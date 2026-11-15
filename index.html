@@ -20727,7 +20727,7 @@ body.cc-modo-cliente #cat-nav-arrow{display:none!important}
     if(hero){
       hero.style.setProperty("background-image",'url("'+url.replace(/"/g,'\\"')+'")',"important");
       hero.style.setProperty("background-size","cover","important");
-      hero.style.setProperty("background-position","center center","important");
+      hero.style.setProperty("background-position","var(--cc-capa-banner-pos,center 30%)","important");
     }
   }
   window.ccAplicarBannerPanoramico=aplicarBanner;
@@ -24872,6 +24872,49 @@ html body #ab-clean-home .abch-tabs .abch-tab .abch-label{background:linear-grad
 html body #ab-clean-home .abch-hero-bg,html body #ab-clean-home .ht-hl{filter:brightness(var(--cc-brilho-banner)) saturate(1.05)!important}
 html body #ab-clean-home .abch-hero-shade{background:linear-gradient(180deg,rgba(3,14,28,0),rgba(3,14,28,.05))!important}
 </style>
+<style id="cc-ajuste-banner-principal-pos-largura">
+/* AJUSTE PONTUAL — banner principal da capa (só apresentação).
+   Foto descida um pouco, para não cortar o topo, e banner um pouco mais largo em telas grandes.
+   Para afinar, mude só as 3 variáveis abaixo:
+   --cc-capa-banner-pos  : posição da foto (center 50% = centro; número menor = aparece mais o topo)
+   --cc-capa-banner-larg : largura máxima do banner (telas a partir de 1024px)
+   --cc-capa-banner-alt  : altura do banner nessas telas (proporcional à largura, para não cortar mais)
+   --cc-capa-banner-extra: altura extra do banner no celular/tablet (19px = 5 mm); as abas descem junto */
+:root{--cc-capa-banner-pos:center 30%;--cc-capa-banner-larg:1000px;--cc-capa-banner-alt:352px;--cc-capa-banner-extra:19px}
+html body #ab-clean-home .abch-hero-bg{background-position:var(--cc-capa-banner-pos)!important}
+/* camadas do carrossel do módulo hotelaria: sem !important, para respeitar posições definidas por foto */
+html body #ab-clean-home .ht-hl{background-position:var(--cc-capa-banner-pos)}
+@media(min-width:1024px){
+  html body #ab-clean-home .abch-hero{max-width:var(--cc-capa-banner-larg)!important;height:var(--cc-capa-banner-alt)!important;min-height:var(--cc-capa-banner-alt)!important}
+}
+/* CELULAR / TABLET: banner ALTO (4:3), chamativo. A foto aparece inteira (sem cortar logo/laterais) e a própria foto, desfocada, preenche o fundo. */
+@media(max-width:1023px){
+  html body #ab-clean-home .abch-hero{width:calc(100% - 12px)!important;max-width:none!important;height:auto!important;min-height:0!important;max-height:none!important;aspect-ratio:4 / 3!important;box-sizing:content-box!important;padding-bottom:var(--cc-capa-banner-extra)!important;background:#0f2340!important}
+  html body #ab-clean-home .abch-hero::before{content:"";position:absolute;inset:-12px;background:var(--cc-capa-banner-url,none) center/cover no-repeat;filter:blur(14px) brightness(.92);z-index:0}
+  html body #ab-clean-home .abch-hero-bg{background-size:contain!important;background-position:center center!important;background-color:transparent!important;z-index:1}
+  html body #ab-clean-home .ht-hl{background-size:cover}
+}
+</style>
+<script id="cc-ajuste-banner-principal-ratio">
+(function(){
+  var ultimo="";
+  function medir(){
+    try{
+      var bg=document.querySelector("#ab-clean-home .abch-hero-bg"); if(!bg) return;
+      var css=bg.style.backgroundImage||getComputedStyle(bg).backgroundImage||"";
+      var m=css.match(/url\(\s*["']?([^"')]+)["']?\s*\)/); if(!m||m[1]===ultimo) return;
+      ultimo=m[1];
+      document.documentElement.style.setProperty("--cc-capa-banner-url",'url("'+m[1].replace(/"/g,"\\\"")+'")');
+      var im=new Image();
+      im.onload=function(){ if(im.naturalWidth&&im.naturalHeight) document.documentElement.style.setProperty("--cc-capa-banner-ratio",im.naturalWidth+" / "+im.naturalHeight); };
+      im.src=m[1];
+    }catch(e){}
+  }
+  document.addEventListener("DOMContentLoaded",medir);
+  window.addEventListener("load",medir);
+  setInterval(medir,1500);
+})();
+</script>
 <style id="cc-totem-abas-css">
 /* ═══ TOTENS (aba Totem Cardápio + aba Totem Hotelaria) ═══ */
 #ab-clean-home .abch-tabs .ht-tile2{display:none!important} /* o tile genérico "Totem" foi substituído pelos dois totens; a apresentação continua no botão ▶ do Totem Hotelaria */
