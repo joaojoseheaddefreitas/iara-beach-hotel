@@ -25629,6 +25629,31 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
     }catch(err){console.warn('[Santerini] migração falhou:',err&&err.message)}
     rodando=false;
   }
+  /* Conferência: abra o app com ?conferir no endereço (ou rode ccConferirCardapio() no console) */
+  function relatorio(){
+    var atuais={},semFoto=[],combos=[],porCat=[],total=0;
+    categorias.forEach(function(c){var n=(c.itens||[]).length;total+=n;porCat.push(c.nome+': '+n);(c.itens||[]).forEach(function(i){
+      atuais[norm(i.nome)]=1;
+      if(!i.img||/sem-foto|^data:image\/svg/.test(i.img))semFoto.push(c.nome+' › '+i.nome);
+      if(/combo/i.test((i.nome||'')+' '+(i.sub||'')))combos.push(i.nome);
+    })});
+    var faltam=[];MENU.forEach(function(c){c.itens.forEach(function(x){if(!atuais[norm(x.nome)])faltam.push(c.nome+' › '+x.nome)})});
+    return {total:total,porCat:porCat,faltam:faltam,semFoto:semFoto,combos:combos};
+  }
+  window.ccRelatorioCardapio=relatorio;
+  window.ccConferirCardapio=function(){
+    var r=relatorio(),esc=function(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;')};
+    function bloco(t,l){return '<h3 style="margin:14px 0 4px;font-size:15px">'+t+' ('+l.length+')</h3>'+(l.length?'<ul style="margin:0;padding-left:18px;font-size:13px">'+l.map(function(x){return '<li>'+esc(x)+'</li>'}).join('')+'</ul>':'<p style="margin:0;font-size:13px;color:#15803d">nenhum</p>')}
+    var d=document.createElement('div');d.id='cc-conferencia';
+    d.style.cssText='position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+    d.innerHTML='<div style="background:#fff;color:#0f2340;max-width:560px;width:100%;max-height:88vh;overflow:auto;border-radius:14px;padding:18px;font-family:system-ui,sans-serif">'
+      +'<div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:17px">Conferência do cardápio</b><button onclick="this.closest(\'#cc-conferencia\').remove()" style="font-size:20px;border:0;background:none;cursor:pointer">✕</button></div>'
+      +'<p style="font-size:13px;margin:8px 0">Total de itens: <b>'+r.total+'</b> · '+esc(r.porCat.join(' · '))+'</p>'
+      +bloco('Itens da lista Casa Santerini que não aparecem com o mesmo nome',r.faltam)
+      +bloco('Itens sem foto',r.semFoto)+bloco('Combos ainda presentes',r.combos)+'</div>';
+    document.body.appendChild(d);
+  };
+  if(/[?&]conferir/.test(location.search))window.addEventListener('cc:nuvem-pronta',function(){setTimeout(function(){window.ccConferirCardapio()},4000)});
   window.addEventListener('cc:nuvem-pronta',function(){setTimeout(aplicar,300)});
   setTimeout(aplicar,6000);setTimeout(aplicar,16000);
 })();
