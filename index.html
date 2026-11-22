@@ -25564,6 +25564,303 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
 })();
 
 </script>
+<script id="cc-pin-mesa">
+/* ═══════════════════════════════════════════════════════════════════════
+   PROTEÇÃO DA MESA — "Código da mesa" (PIN de 4 dígitos por sessão)
+   Problema: o QR da mesa é fixo (?role=cliente&mesa=N). Qualquer pessoa que
+   escaneie podia pedir/ver a conta/chamar o garçom na mesa de outro cliente.
+   Regra:
+     1) Mesa LIVRE: o 1º celular que confirma um pedido vira o "dono" e a mesa
+        ganha um código de 4 dígitos (gravado em mesas.pin_sessao no Supabase).
+     2) Mesa EM USO: qualquer outro celular precisa digitar o código para
+        pedir, ver a conta, pagar ou chamar o garçom. Sem código = bloqueado.
+     3) O código aparece para o dono (selo fixo na tela) e para a equipe
+        (cartão da mesa no painel do atendente, com botão Trocar/Gerar).
+     4) Ao liberar a mesa, o código é apagado: a próxima sessão tem outro.
+   Exige a coluna mesas.pin_sessao (ver supabase-pin-mesa.sql). Sem a coluna,
+   o módulo se desliga sozinho (não quebra o app) e avisa no console.
+   ═══════════════════════════════════════════════════════════════════════ */
+(function () {
+  "use strict";
+  if (window.__ccPinMesa) return; window.__ccPinMesa = true;
+
+  var semColuna = false, ocupado = false;
+  var K_OK = "cc_pin_ok_", K_TENT = "cc_pin_tent_", MAX_TENT = 5, BLOQ_MS = 5 * 60 * 1000;
+
+  function ls(k, v) { try { if (v === undefined) return localStorage.getItem(k); if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} return null; }
+  function emp() { return window.COOKCONTROL_EMPRESA_ID_ATIVA; }
+  function sb() { return ccGetSupabaseClient(); }
+  function equipe() { try { return typeof window.ccDispositivoEquipe === "function" && !!window.ccDispositivoEquipe(); } catch (e) { return false; } }
+  function cliente() { try { return !equipe() && typeof ccEhAcessoCliente === "function" && ccEhAcessoCliente(); } catch (e) { return false; } }
+  function mesaAtual() {
+    var m = null;
+    try { if (typeof S !== "undefined" && S && S.mesa) m = S.mesa; } catch (e) {}
+    if (!m) { try { m = new URLSearchParams(location.search).get("mesa"); } catch (e) {} }
+    if (!m) m = ls("wl_mesa_atual_cliente");
+    m = parseInt(m, 10); return m > 0 ? m : null;
+  }
+  function pad(n) { return String(n).padStart(2, "0"); }
+  function novoPin() {
+    try { var a = new Uint32Array(1); crypto.getRandomValues(a); return String(1000 + (a[0] % 9000)); }
+    catch (e) { return String(1000 + Math.floor(Math.random() * 9000)); }
+  }
+  function erroColuna(e) { return !!e && /pin_sessao|42703|does not exist|schema cache/i.test(String(e.message || "") + " " + String(e.code || "")); }
+  function aviso(t) { try { if (typeof toast === "function") toast(t); } catch (e) {} }
+
+  /* ─── leitura / gravação no Supabase ─── */
+  async function lerMesa(n) {
+    var r = await sb().from("mesas").select("numero,status,pin_sessao").eq("empresa_id", emp()).eq("numero", n).maybeSingle();
+    if (r && r.error) { if (erroColuna(r.error)) semColuna = true; return { erro: r.error }; }
+    return { row: (r && r.data) || null };
+  }
+  /* Reivindica o código SÓ se ainda estiver como esperado (null = ninguém, ou o código velho). Sem corrida entre dois celulares. */
+  async function reivindicar(n, pinAntigo) {
+    var pin = novoPin();
+    var q = sb().from("mesas").update({ pin_sessao: pin }).eq("empresa_id", emp()).eq("numero", n);
+    q = pinAntigo ? q.eq("pin_sessao", pinAntigo) : q.is("pin_sessao", null);
+    var r = await q.select("numero");
+    if (r && r.error) { if (erroColuna(r.error)) semColuna = true; return null; }
+    if (!r || !r.data || !r.data.length) {            // linha da mesa ainda não existe: cria
+      var ins = await sb().from("mesas").insert({ empresa_id: emp(), numero: n, status: "livre", total: 0, pin_sessao: pin });
+      if (ins && ins.error) { if (erroColuna(ins.error)) semColuna = true; return null; }
+    }
+    var c = await lerMesa(n);                          // confirma que o código gravado é MESMO o meu
+    return (c.row && c.row.pin_sessao === pin) ? pin : null;
+  }
+
+  /* ─── decide se ESTE celular pode agir na mesa n ─── */
+  async function garantirAcesso(n) {
+    if (equipe() || !emp()) return { ok: true };
+    var l = await lerMesa(n);
+    if (semColuna) { console.warn("[Código da mesa] coluna mesas.pin_sessao não existe — rode supabase-pin-mesa.sql. Proteção DESLIGADA."); return { ok: true }; }
+    if (l.erro) return ls(K_OK + n) ? { ok: true } : { ok: false, motivo: "offline" };
+    var row = l.row, pin = row && row.pin_sessao, st = (row && row.status) || "livre";
+    if (pin) {
+      if (ls(K_OK + n) === pin) return { ok: true, pin: pin };
+      if (st === "livre") {                            // código velho de alguém que nunca chegou a pedir: retoma
+        var p0 = await reivindicar(n, pin);
+        if (p0) { ls(K_OK + n, p0); return { ok: true, pin: p0, novo: true }; }
+      }
+      return { ok: false, motivo: "pin" };
+    }
+    if (st !== "livre") return { ok: false, motivo: "semcodigo" };   // mesa aberta pela equipe sem código: equipe precisa gerar
+    var p = await reivindicar(n, null);
+    if (p) { ls(K_OK + n, p); return { ok: true, pin: p, novo: true }; }
+    return { ok: false, motivo: "pin" };               // outro celular chegou primeiro
+  }
+
+  /* ─── interface ─── */
+  function css() {
+    if (document.getElementById("cc-pin-css")) return;
+    var s = document.createElement("style"); s.id = "cc-pin-css";
+    s.textContent =
+      "#cc-pin-gate{position:fixed;inset:0;z-index:2147483000;background:rgba(15,35,64,.78);display:flex;align-items:center;justify-content:center;padding:18px;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}" +
+      "#cc-pin-gate .cc-box{background:#fff;border-radius:22px;max-width:380px;width:100%;padding:24px 20px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.4)}" +
+      "#cc-pin-gate h2{font-size:1.15rem;font-weight:900;color:#0f2340;margin:6px 0}" +
+      "#cc-pin-gate p{font-size:.85rem;color:#475569;line-height:1.4;margin:6px 0}" +
+      "#cc-pin-gate input{width:100%;box-sizing:border-box;text-align:center;font-size:2rem;letter-spacing:.7rem;font-weight:900;padding:10px 0 10px .7rem;border:2px solid #cbd5e1;border-radius:14px;margin:12px 0 4px;color:#0f2340}" +
+      "#cc-pin-gate input:focus{outline:none;border-color:#ea580c}" +
+      "#cc-pin-gate .cc-err{color:#b91c1c;font-weight:700;font-size:.8rem;min-height:1.1em}" +
+      "#cc-pin-gate button{width:100%;border:0;border-radius:14px;padding:13px;font-weight:900;font-size:1rem;cursor:pointer;margin-top:8px}" +
+      "#cc-pin-gate .cc-ok{background:linear-gradient(135deg,#ea580c,#f59e0b);color:#fff}" +
+      "#cc-pin-gate .cc-sec{background:#f1f5f9;color:#475569;font-size:.85rem}" +
+      "#cc-pin-chip{position:fixed;left:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));z-index:2147482000;background:#0f2340;color:#fff;border-radius:999px;padding:7px 13px;font:800 .75rem system-ui,sans-serif;box-shadow:0 6px 18px rgba(0,0,0,.3);cursor:pointer}" +
+      "#cc-pin-chip b{letter-spacing:.15rem;color:#fbbf24}" +
+      ".cc-pin-linha{border-top:1px dashed #e5e7eb;margin-top:8px;padding-top:8px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:.72rem;color:#64748b}" +
+      ".cc-pin-linha b{font-size:1rem;letter-spacing:.2rem;color:#0f2340}" +
+      ".cc-pin-linha button{border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:3px 9px;font-weight:800;font-size:.7rem;color:#0f2340;cursor:pointer}";
+    document.head.appendChild(s);
+  }
+  function fechaGate() { var g = document.getElementById("cc-pin-gate"); if (g) g.remove(); }
+
+  function bloqueado(n) {
+    try { var t = JSON.parse(ls(K_TENT + n) || "null"); if (t && t.ate && Date.now() < t.ate) return Math.ceil((t.ate - Date.now()) / 60000); } catch (e) {}
+    return 0;
+  }
+  function errou(n) {
+    var t = null; try { t = JSON.parse(ls(K_TENT + n) || "null"); } catch (e) {}
+    t = t && !(t.ate && Date.now() >= t.ate) ? t : { c: 0 };
+    t.c = (t.c || 0) + 1;
+    if (t.c >= MAX_TENT) { t = { c: 0, ate: Date.now() + BLOQ_MS }; }
+    ls(K_TENT + n, JSON.stringify(t));
+    return t;
+  }
+
+  /* Abre a janela do código. Resolve true se o código certo foi digitado; false se a pessoa só quis ver o cardápio. */
+  function gate(n, motivo, podeFechar) {
+    css(); fechaGate();
+    return new Promise(function (resolve) {
+      var g = document.createElement("div"); g.id = "cc-pin-gate";
+      var semCod = motivo === "semcodigo", off = motivo === "offline";
+      g.innerHTML = '<div class="cc-box"><div style="font-size:2.2rem">🔐</div>' +
+        "<h2>Mesa " + pad(n) + " já está em uso</h2>" +
+        (off ? "<p>Sem conexão para confirmar a mesa. Conecte-se à internet e tente de novo.</p>"
+          : semCod ? "<p>Esta mesa já foi aberta pelo garçom. Peça a ele o <b>código da mesa</b> para continuar.</p>"
+          : "<p>Para proteger a conta de quem está sentado, digite o <b>código de 4 dígitos</b> da mesa.<br>Ele está no celular de quem abriu a mesa — ou peça ao garçom.</p>") +
+        (off || semCod ? "" : '<input id="cc-pin-in" type="tel" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="••••"><div class="cc-err" id="cc-pin-err"></div><button class="cc-ok" id="cc-pin-go">Entrar na mesa</button>') +
+        (podeFechar !== false ? '<button class="cc-sec" id="cc-pin-no">Só ver o cardápio</button>' : "") + "</div>";
+      document.body.appendChild(g);
+      var inp = g.querySelector("#cc-pin-in"), err = g.querySelector("#cc-pin-err");
+      var no = g.querySelector("#cc-pin-no"); if (no) no.onclick = function () { fechaGate(); resolve(false); };
+      var go = g.querySelector("#cc-pin-go"); if (!inp || !go) return;
+      setTimeout(function () { try { inp.focus(); } catch (e) {} }, 150);
+      inp.addEventListener("input", function () { inp.value = inp.value.replace(/\D/g, "").slice(0, 4); if (inp.value.length === 4) go.click(); });
+      go.onclick = async function () {
+        var m = bloqueado(n);
+        if (m) { err.textContent = "Muitas tentativas. Aguarde " + m + " min ou chame o garçom."; return; }
+        if (inp.value.length !== 4) { err.textContent = "Digite os 4 dígitos."; return; }
+        go.disabled = true; err.textContent = "Conferindo…";
+        var l = await lerMesa(n); go.disabled = false;
+        var pin = l.row && l.row.pin_sessao;
+        if (l.erro) { err.textContent = "Sem conexão. Tente de novo."; return; }
+        if (!pin) { fechaGate(); resolve(true); return; }            // mesa foi liberada enquanto isso
+        if (inp.value === pin) { ls(K_OK + n, pin); ls(K_TENT + n, null); fechaGate(); chip(); resolve(true); return; }
+        var t = errou(n); inp.value = "";
+        err.textContent = t.ate ? "Muitas tentativas. Aguarde 5 min ou chame o garçom." : "Código incorreto. Restam " + (MAX_TENT - t.c) + " tentativa(s).";
+      };
+    });
+  }
+
+  function avisoDono(n, pin) {
+    css(); fechaGate();
+    var g = document.createElement("div"); g.id = "cc-pin-gate";
+    g.innerHTML = '<div class="cc-box"><div style="font-size:2.2rem">✅</div><h2>Mesa ' + pad(n) + " é sua!</h2>" +
+      '<p>O código da sua mesa é</p><div style="font-size:2.6rem;font-weight:900;letter-spacing:.6rem;color:#ea580c;padding-left:.6rem">' + pin + "</div>" +
+      "<p>Passe esse código <b>só para quem está sentado com você</b>. Quem não tiver o código não consegue pedir nem ver a conta da mesa.</p>" +
+      '<button class="cc-ok" id="cc-pin-wa" style="background:#16a34a">📲 Enviar código pelo WhatsApp</button>' +
+      '<button class="cc-sec" id="cc-pin-fim">Entendi</button></div>';
+    document.body.appendChild(g);
+    g.querySelector("#cc-pin-fim").onclick = fechaGate;
+    g.querySelector("#cc-pin-wa").onclick = function () {
+      var nome = ""; try { nome = (window.config && window.config.nome) || ""; } catch (e) {}
+      var txt = "Código da mesa " + pad(n) + (nome ? " (" + nome + ")" : "") + ": " + pin + "\nEscaneie o QR da mesa e digite este código para pedir.";
+      try { if (navigator.share) { navigator.share({ text: txt }).catch(function () {}); return; } } catch (e) {}
+      window.open("https://wa.me/?text=" + encodeURIComponent(txt), "_blank");
+    };
+  }
+
+  /* Selo fixo "Código da mesa" nos celulares autorizados */
+  async function chip() {
+    if (!cliente()) return;
+    var n = mesaAtual(), el = document.getElementById("cc-pin-chip");
+    if (!n || !emp()) { if (el) el.remove(); return; }
+    var l = await lerMesa(n), pin = l.row && l.row.pin_sessao;
+    if (l.erro || !pin || ls(K_OK + n) !== pin) { if (el) el.remove(); return; }
+    css();
+    if (!el) { el = document.createElement("div"); el.id = "cc-pin-chip"; el.onclick = function () { avisoDono(mesaAtual(), ls(K_OK + mesaAtual())); }; document.body.appendChild(el); }
+    el.innerHTML = "🔐 Mesa " + pad(n) + " · código <b>" + pin + "</b>";
+  }
+
+  /* Núcleo: libera a ação ou pede o código. Resolve true/false. */
+  async function protegido(n, pedido) {
+    if (ocupado) return false; ocupado = true;
+    try {
+      /* Pedido PRÉ-PAGO (praia/híbrido ou "pagar agora"): só vai à cozinha depois do Pix confirmado e NÃO entra na conta da mesa.
+         Quem pede paga o próprio pedido, então não há conta de terceiro a proteger: sem código, sem atrito. */
+      /* O código vale em TODAS as mesas (salão e praia), pré-pago ou não. */
+      var a = await garantirAcesso(n);
+      if (a.ok) { if (a.novo) { chip(); avisoDono(n, a.pin); } return true; }
+      return await gate(n, a.motivo, true);
+    } catch (e) { console.warn("[Código da mesa]", e && e.message); return true; }   // falha inesperada nunca trava o restaurante
+    finally { ocupado = false; }
+  }
+
+  /* Envolve as ações do cliente: pedir, pagar, chamar garçom */
+  function envolver(nome, pedido) {
+    var orig = window[nome];
+    if (typeof orig !== "function" || orig.__ccpin) return;
+    var w = function () {
+      var self = this, args = arguments;
+      if (equipe()) return orig.apply(self, args);
+      var n = mesaAtual(); if (!n) return orig.apply(self, args);
+      return protegido(n, pedido).then(function (ok) { if (ok) return orig.apply(self, args); });
+    };
+    w.__ccpin = true; window[nome] = w;
+  }
+
+  /* Mesa liberada => apaga o código. Equipe abrindo mesa => garante que ela tenha código. */
+  async function limpar(n) {
+    try {
+      if (!emp()) return;
+      var linha = { empresa_id: emp(), numero: Number(n), pin_sessao: null };
+      if (typeof ccEscreverComResiliencia === "function") await ccEscreverComResiliencia("mesas", linha, "empresa_id,numero");
+      else await sb().from("mesas").upsert(linha, { onConflict: "empresa_id,numero" });
+      ls(K_OK + n, null);
+    } catch (e) {}
+  }
+  async function garantirEquipe(n) {
+    try { if (!emp() || semColuna) return; var l = await lerMesa(n); if (!l.erro && !(l.row && l.row.pin_sessao)) await reivindicar(Number(n), null); } catch (e) {}
+  }
+  var oSet = window.ccSetMesaStatus;
+  if (typeof oSet === "function" && !oSet.__ccpin) {
+    var wSet = function (numero, status) {
+      var r = oSet.apply(this, arguments);
+      try { if (status === "livre") limpar(numero); else if (equipe()) garantirEquipe(numero); } catch (e) {}
+      return r;
+    };
+    wSet.__ccpin = true; window.ccSetMesaStatus = wSet;
+  }
+
+  /* Painel da equipe: código em cada cartão de mesa + Trocar/Gerar */
+  window.ccPinMesaEquipe = async function (n, acao) {
+    n = Number(n);
+    if (acao === "trocar" && !confirm("Trocar o código da Mesa " + pad(n) + "?\n\nQuem já está na mesa (inclusive o dono) precisará digitar o código novo. Use se alguém de fora conseguiu entrar.")) return;
+    var pin = novoPin();
+    var r = await sb().from("mesas").update({ pin_sessao: pin }).eq("empresa_id", emp()).eq("numero", n).select("numero");
+    if (r && r.error) { aviso("❌ Não foi possível gerar o código: " + (r.error.message || "erro")); return; }
+    if (!r.data || !r.data.length) { var i = await sb().from("mesas").insert({ empresa_id: emp(), numero: n, status: "livre", total: 0, pin_sessao: pin }); if (i && i.error) { aviso("❌ " + (i.error.message || "erro")); return; } }
+    aviso("🔐 Mesa " + pad(n) + ": novo código " + pin);
+    decorarEquipe();
+  };
+  async function decorarEquipe() {
+    try {
+      if (!equipe() || !emp() || semColuna) return;
+      var grid = document.getElementById("at-mesas-grid"); if (!grid) return;
+      var r = await sb().from("mesas").select("numero,status,pin_sessao").eq("empresa_id", emp());
+      if (r.error) { if (erroColuna(r.error)) semColuna = true; return; }
+      var mapa = {}; (r.data || []).forEach(function (x) { mapa[Number(x.numero)] = x; });
+      css();
+      grid.querySelectorAll(".admin-card").forEach(function (card) {
+        var t = card.querySelector("span.font-black"); var m = t && t.textContent.match(/Mesa\s+(\d+)/); if (!m) return;
+        var n = parseInt(m[1], 10), x = mapa[n] || {};
+        var old = card.querySelector(".cc-pin-linha"); if (old) old.remove();
+        var html;
+        if (x.pin_sessao) html = '<span>🔐 Código da mesa: <b>' + x.pin_sessao + '</b></span><button onclick="ccPinMesaEquipe(' + n + ',\'trocar\')">🔄 Trocar</button>';
+        else if (x.status && x.status !== "livre") html = '<span>🔐 Mesa sem código (aberta antes da proteção)</span><button onclick="ccPinMesaEquipe(' + n + ',\'gerar\')">Gerar código</button>';
+        else return;
+        card.insertAdjacentHTML("beforeend", '<div class="cc-pin-linha">' + html + "</div>");
+      });
+    } catch (e) {}
+  }
+  var oAt = window.renderAtendente;
+  if (typeof oAt === "function" && !oAt.__ccpin) {
+    var wAt = function () { var r = oAt.apply(this, arguments); setTimeout(decorarEquipe, 50); return r; };
+    wAt.__ccpin = true; window.renderAtendente = wAt;
+  }
+  setInterval(function () { if (equipe() && !document.hidden) decorarEquipe(); }, 15000);
+
+  /* Envolve as ações (depois que todos os outros scripts já definiram as funções) */
+  function aplicar() { envolver("enviarPedido", true); envolver("ccClientePagarPix"); envolver("ccChamarGarcomCartao"); }
+  aplicar(); setTimeout(aplicar, 1500); setTimeout(aplicar, 6000);
+
+  /* Ao abrir pelo QR: se a mesa já tem dono e este celular não sabe o código, pede já (dá pra fechar e só ver o cardápio) */
+  function aoAbrir() {
+    if (!cliente()) return;
+    var n = mesaAtual(); if (!n || !emp()) return;
+    lerMesa(n).then(function (l) {
+      if (semColuna || l.erro || !l.row || !l.row.pin_sessao) return;
+      if (ls(K_OK + n) === l.row.pin_sessao) { chip(); return; }
+      ls(K_OK + n, null);
+      gate(n, "pin", true);
+    });
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { setTimeout(aoAbrir, 1800); });
+  else setTimeout(aoAbrir, 1800);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden && cliente()) chip(); });
+  setInterval(function () { if (cliente() && !document.hidden) chip(); }, 30000);
+})();
+
+</script>
 </body></html>
 
 <style id="cc-mobile-layout-final">
