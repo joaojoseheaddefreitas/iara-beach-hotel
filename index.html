@@ -25566,25 +25566,31 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
 </script>
 <script id="cc-pin-mesa">
 /* ═══════════════════════════════════════════════════════════════════════
-   PROTEÇÃO DA MESA — "Código da mesa" (PIN de 4 dígitos por sessão)
-   Problema: o QR da mesa é fixo (?role=cliente&mesa=N). Qualquer pessoa que
-   escaneie podia pedir/ver a conta/chamar o garçom na mesa de outro cliente.
-   Regra:
-     1) Mesa LIVRE: o 1º celular que confirma um pedido vira o "dono" e a mesa
-        ganha um código de 4 dígitos (gravado em mesas.pin_sessao no Supabase).
-     2) Mesa EM USO: qualquer outro celular precisa digitar o código para
-        pedir, ver a conta, pagar ou chamar o garçom. Sem código = bloqueado.
-     3) O código aparece para o dono (selo fixo na tela) e para a equipe
-        (cartão da mesa no painel do atendente, com botão Trocar/Gerar).
-     4) Ao liberar a mesa, o código é apagado: a próxima sessão tem outro.
-   Exige a coluna mesas.pin_sessao (ver supabase-pin-mesa.sql). Sem a coluna,
-   o módulo se desliga sozinho (não quebra o app) e avisa no console.
+   PROTEÇÃO DA MESA — "Código da mesa" (PIN de 4 dígitos) v3
+   1) ABRIR: ao escanear o QR de uma mesa LIVRE, a mesa já vira OCUPADA e o
+      celular recebe o código de 4 dígitos (antes de qualquer pedido).
+      Outro aparelho no mesmo QR só entra digitando o código.
+   2) SAIR: "🚪 Estou indo embora" só funciona com ZERO pedidos da sessão em
+      aberto (inclui entregues e não pagos). Senão avisa e leva à Minha Conta.
+   3) ENCERRAR ≠ LIBERAR: ao sair, o código do cliente é invalidado (ninguém
+      mais pede por ele) mas a mesa CONTINUA OCUPADA. Só o garçom, ao arrumar a
+      mesa e liberar no painel (fluxo que já existe), a deixa LIVRE de novo.
+   Guardado em mesas.pin_sessao (coluna já criada):  "4821@<início da sessão>"
+   Cliente saiu:  "SAIU@<início da sessão>".   Sem novos status nem cores.
    ═══════════════════════════════════════════════════════════════════════ */
 (function () {
   "use strict";
   if (window.__ccPinMesa) return; window.__ccPinMesa = true;
 
   var semColuna = false, ocupado = false;
+  /* Mesa ocupada SEM NENHUM pedido por este tempo (min) é considerada abandonada: o próximo que escanear assume. */
+  var MIN_SEM_CONSUMO = 60;
+  /* Regra do dono: SÓ o garçom devolve a mesa para Livre. Auto-liberar "mesa sem consumo" derrubaria quem só senta,
+     aluga guarda-sol ou usa a piscina. Para voltar ao comportamento antigo (liberar sozinha após MIN_SEM_CONSUMO min): true. */
+  var LIBERAR_OCIOSA = false;
+  /* Pedido "aguardando pagamento" também é valor em aberto no "🚪 Estou indo embora" (regra rigorosa). */
+  var CONTAR_AGUARDANDO = true;
+  var _gateVisto = false;
   var K_OK = "cc_pin_ok_", K_TENT = "cc_pin_tent_", MAX_TENT = 5, BLOQ_MS = 5 * 60 * 1000;
 
   function ls(k, v) { try { if (v === undefined) return localStorage.getItem(k); if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} return null; }
@@ -25600,53 +25606,146 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
     m = parseInt(m, 10); return m > 0 ? m : null;
   }
   function pad(n) { return String(n).padStart(2, "0"); }
+  function brl(v) { return "R$ " + Number(v).toFixed(2).replace(".", ","); }
   function novoPin() {
     try { var a = new Uint32Array(1); crypto.getRandomValues(a); return String(1000 + (a[0] % 9000)); }
     catch (e) { return String(1000 + Math.floor(Math.random() * 9000)); }
   }
+  /* valor guardado:  "4821@1732251234567"  |  "SAIU@1732251234567" */
+  function pinOf(raw) { return raw ? String(raw).split("@")[0] : null; }
+  function iniOf(raw) { var p = raw ? String(raw).split("@") : []; return Number(p[1]) || 0; }
+  function novoRaw(pin, ini) { return pin + "@" + (ini || Date.now()); }
   function erroColuna(e) { return !!e && /pin_sessao|42703|does not exist|schema cache/i.test(String(e.message || "") + " " + String(e.code || "")); }
   function aviso(t) { try { if (typeof toast === "function") toast(t); } catch (e) {} }
 
-  /* ─── leitura / gravação no Supabase ─── */
+  /* ─── Supabase ─── */
   async function lerMesa(n) {
-    var r = await sb().from("mesas").select("numero,status,pin_sessao").eq("empresa_id", emp()).eq("numero", n).maybeSingle();
+    var r = await sb().from("mesas").select("numero,status,total,pin_sessao").eq("empresa_id", emp()).eq("numero", n).maybeSingle();
     if (r && r.error) { if (erroColuna(r.error)) semColuna = true; return { erro: r.error }; }
     return { row: (r && r.data) || null };
   }
-  /* Reivindica o código SÓ se ainda estiver como esperado (null = ninguém, ou o código velho). Sem corrida entre dois celulares. */
-  async function reivindicar(n, pinAntigo) {
-    var pin = novoPin();
-    var q = sb().from("mesas").update({ pin_sessao: pin }).eq("empresa_id", emp()).eq("numero", n);
-    q = pinAntigo ? q.eq("pin_sessao", pinAntigo) : q.is("pin_sessao", null);
+  /* Reivindica o código SÓ se ainda estiver como esperado (null ou o valor antigo). Sem corrida entre aparelhos. Devolve o valor gravado (raw) ou null. */
+  async function reivindicar(n, rawAntigo, iniMantido) {
+    var raw = novoRaw(novoPin(), iniMantido);
+    var q = sb().from("mesas").update({ pin_sessao: raw }).eq("empresa_id", emp()).eq("numero", n);
+    q = rawAntigo ? q.eq("pin_sessao", rawAntigo) : q.is("pin_sessao", null);
     var r = await q.select("numero");
     if (r && r.error) { if (erroColuna(r.error)) semColuna = true; return null; }
-    if (!r || !r.data || !r.data.length) {            // linha da mesa ainda não existe: cria
-      var ins = await sb().from("mesas").insert({ empresa_id: emp(), numero: n, status: "livre", total: 0, pin_sessao: pin });
+    if (!r || !r.data || !r.data.length) {
+      var ins = await sb().from("mesas").insert({ empresa_id: emp(), numero: n, status: "livre", total: 0, pin_sessao: raw });
       if (ins && ins.error) { if (erroColuna(ins.error)) semColuna = true; return null; }
     }
-    var c = await lerMesa(n);                          // confirma que o código gravado é MESMO o meu
-    return (c.row && c.row.pin_sessao === pin) ? pin : null;
+    var c = await lerMesa(n);
+    return (c.row && c.row.pin_sessao === raw) ? raw : null;
+  }
+  /* Mesa passa a OCUPADA (mesmo caminho que o app já usa ao pedir) */
+  function marcarOcupada(n) {
+    try { if (typeof ccSetMesaStatus === "function") ccSetMesaStatus(n, "ocupada", 0); } catch (e) {}
+    /* rede de segurança: com código ativo, a nuvem nunca pode ficar "livre" (só vira livre pelo garçom) */
+    try { sb().from("mesas").update({ status: "ocupada" }).eq("empresa_id", emp()).eq("numero", n).eq("status", "livre").then(function () {}, function () {}); } catch (e) {}
+  }
+  /* Este aparelho passa a ver a conta da mesa só a partir do início desta sessão */
+  function alinharConta(n, raw) {
+    try {
+      var ini = iniOf(raw); if (!ini || typeof mesaSessaoInicio === "undefined") return;
+      var at = mesaSessaoInicio[n] ? new Date(mesaSessaoInicio[n]).getTime() : 0;
+      if (at < ini) { mesaSessaoInicio[n] = new Date(ini).toISOString(); salvar("mesaSessaoInicio", mesaSessaoInicio); }
+    } catch (e) {}
+  }
+
+  /* ─── CONTA EM ABERTO DA SESSÃO (regra rigorosa) ───
+     Junta TODAS as fontes (nuvem + cozinha local + histórico local) por id do pedido.
+     Conta como "em aberto" todo pedido da mesa, desta sessão, não pago — mesmo já ENTREGUE. */
+  async function contaAberta(n, ini) {
+    var mapa = {};
+    function pega(p, fonte) {
+      if (!p || p.id == null || Number(p.mesa) !== n) return;
+      var m = mapa[p.id] || (mapa[p.id] = { total: 0, data: 0, pago: false, aguard: false, coz: false });
+      m.total = Number(p.total) || m.total;
+      var t = new Date(p.data).getTime(); if (t) m.data = t;
+      if (p.pago || p.contaFechada || p.prePago) m.pago = true;
+      if (fonte === "coz") { m.coz = true; m.aguard = false; }
+      else if (p.status === "aguardando_pagamento" && !m.coz) m.aguard = true;
+    }
+    try { (typeof pedidosCozinha !== "undefined" ? pedidosCozinha : []).forEach(function (p) { pega(p, "coz"); }); } catch (e) {}
+    var r = await sb().from("pedidos_cozinha").select("dados").eq("chave", (emp() || (window.COOKCONTROL_CONFIG && window.COOKCONTROL_CONFIG.empresaId)) + ":pedidosCozinha_v1").maybeSingle();
+    if (r && r.error) return { erro: true };
+    if (r && r.data && Array.isArray(r.data.dados)) r.data.dados.forEach(function (p) { pega(p, "coz"); });
+    try { (typeof historico !== "undefined" ? historico : []).forEach(function (h) { pega(h, "hist"); }); } catch (e) {}
+    var soma = 0, qtd = 0, qtdSessao = 0;
+    Object.keys(mapa).forEach(function (id) {
+      var m = mapa[id];
+      if (m.data >= ini) qtdSessao++;
+      if ((m.aguard && !CONTAR_AGUARDANDO) || m.pago || !(m.data >= ini) || !(m.total > 0.009)) return;
+      soma += m.total; qtd++;
+    });
+    return { soma: Math.round(soma * 100) / 100, qtd: qtd, qtdSessao: qtdSessao };
+  }
+  /* Mesa abandonada: ocupada, código ativo, passou do prazo e NENHUM pedido na sessão */
+  async function mesaOciosa(row) {
+    try {
+      if (!LIBERAR_OCIOSA) return false;
+      var raw = row && row.pin_sessao; if (!raw || pinOf(raw) === "SAIU" || !row.status || row.status === "livre") return false;
+      var ini = iniOf(raw); if (!ini || Date.now() - ini < MIN_SEM_CONSUMO * 60000) return false;
+      var c = await contaAberta(Number(row.numero), ini);
+      return !c.erro && c.qtdSessao === 0;
+    } catch (e) { return false; }
+  }
+  /* Mantém o "saldo da mesa" (usado pelo Pix) igual à conta rigorosa, incluindo itens entregues e não pagos */
+  async function sincronizarSaldo(n) {
+    try {
+      if (!emp() || semColuna) return;
+      var l = await lerMesa(n); var raw = l.row && l.row.pin_sessao; if (!raw || !iniOf(raw)) return;
+      var c = await contaAberta(n, iniOf(raw)); if (c.erro) return;
+      if (Math.abs((Number(l.row.total) || 0) - c.soma) < 0.005) return;
+      await sb().from("mesas").update({ total: c.soma }).eq("empresa_id", emp()).eq("numero", n).eq("pin_sessao", raw);
+    } catch (e) {}
+  }
+  /* Pix do cliente confirmado: baixa os pedidos mais antigos até cobrir o valor pago */
+  async function marcarPagosPix(n, valor) {
+    try {
+      var l = await lerMesa(n); var ini = iniOf(l.row && l.row.pin_sessao) || iniOf(ls(K_OK + n)); if (!ini) return;
+      var rest = Number(valor) || 0;
+      var lista = (typeof pedidosCozinha !== "undefined" ? pedidosCozinha : []).filter(function (p) { return Number(p.mesa) === n && !p.pago && new Date(p.data).getTime() >= ini && (Number(p.total) || 0) > 0.009; })
+        .sort(function (a, b) { return new Date(a.data) - new Date(b.data); });
+      var mudou = false;
+      lista.forEach(function (p) { var t = Number(p.total) || 0; if (t <= rest + 0.01) { p.pago = true; p.pagoEm = new Date().toISOString(); rest -= t; mudou = true; } });
+      if (mudou) salvar("pedidosCozinha_v1", pedidosCozinha);
+    } catch (e) {}
+  }
+  function marcarPre(n, pre, t0) {
+    try {
+      if (!pre) return; var ids = {};
+      (historico || []).forEach(function (h) { if (Number(h.mesa) === n && new Date(h.data).getTime() >= t0 && !h.prePago) { h.prePago = true; ids[h.id] = 1; } });
+      (pedidosCozinha || []).forEach(function (p) { if (ids[p.id]) p.prePago = true; });
+      salvar("historico", historico); salvar("pedidosCozinha_v1", pedidosCozinha);
+    } catch (e) {}
   }
 
   /* ─── decide se ESTE celular pode agir na mesa n ─── */
   async function garantirAcesso(n) {
     if (equipe() || !emp()) return { ok: true };
     var l = await lerMesa(n);
-    if (semColuna) { console.warn("[Código da mesa] coluna mesas.pin_sessao não existe — rode supabase-pin-mesa.sql. Proteção DESLIGADA."); return { ok: true }; }
+    if (semColuna) { console.warn("[Código da mesa] coluna mesas.pin_sessao não existe — proteção DESLIGADA."); return { ok: true }; }
     if (l.erro) return ls(K_OK + n) ? { ok: true } : { ok: false, motivo: "offline" };
-    var row = l.row, pin = row && row.pin_sessao, st = (row && row.status) || "livre";
-    if (pin) {
-      if (ls(K_OK + n) === pin) return { ok: true, pin: pin };
-      if (st === "livre") {                            // código velho de alguém que nunca chegou a pedir: retoma
-        var p0 = await reivindicar(n, pin);
-        if (p0) { ls(K_OK + n, p0); return { ok: true, pin: p0, novo: true }; }
+    var row = l.row, raw = row && row.pin_sessao, st = (row && row.status) || "livre";
+    if (raw) {
+      if (ls(K_OK + n) === raw) return { ok: true, raw: raw };
+      if (pinOf(raw) === "SAIU" && st !== "livre") return { ok: false, motivo: "saiu" };   // SAIU numa mesa já LIVRE = sobra: cai no "retoma" abaixo
+      if (st !== "livre" && await mesaOciosa(row)) {      // mesa abandonada (sem pedido há muito tempo): assume
+        var pa = await reivindicar(n, raw);
+        if (pa) { ls(K_OK + n, pa); alinharConta(n, pa); marcarOcupada(n); return { ok: true, raw: pa, novo: true }; }
+      }
+      if (st === "livre") {                              // código velho de mesa já liberada: retoma
+        var p0 = await reivindicar(n, raw);
+        if (p0) { ls(K_OK + n, p0); alinharConta(n, p0); marcarOcupada(n); return { ok: true, raw: p0, novo: true }; }
       }
       return { ok: false, motivo: "pin" };
     }
-    if (st !== "livre") return { ok: false, motivo: "semcodigo" };   // mesa aberta pela equipe sem código: equipe precisa gerar
+    if (st !== "livre") return { ok: false, motivo: "semcodigo" };
     var p = await reivindicar(n, null);
-    if (p) { ls(K_OK + n, p); return { ok: true, pin: p, novo: true }; }
-    return { ok: false, motivo: "pin" };               // outro celular chegou primeiro
+    if (p) { ls(K_OK + n, p); alinharConta(n, p); marcarOcupada(n); return { ok: true, raw: p, novo: true }; }
+    return { ok: false, motivo: "pin" };
   }
 
   /* ─── interface ─── */
@@ -25672,7 +25771,6 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
     document.head.appendChild(s);
   }
   function fechaGate() { var g = document.getElementById("cc-pin-gate"); if (g) g.remove(); }
-
   function bloqueado(n) {
     try { var t = JSON.parse(ls(K_TENT + n) || "null"); if (t && t.ate && Date.now() < t.ate) return Math.ceil((t.ate - Date.now()) / 60000); } catch (e) {}
     return 0;
@@ -25686,18 +25784,20 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
     return t;
   }
 
-  /* Abre a janela do código. Resolve true se o código certo foi digitado; false se a pessoa só quis ver o cardápio. */
+  /* Janela do código para quem chegou depois. Resolve true se acertou; false se só quis ver o cardápio. */
   function gate(n, motivo, podeFechar) {
+    _gateVisto = true;
     css(); fechaGate();
     return new Promise(function (resolve) {
       var g = document.createElement("div"); g.id = "cc-pin-gate";
-      var semCod = motivo === "semcodigo", off = motivo === "offline";
-      g.innerHTML = '<div class="cc-box"><div style="font-size:2.2rem">🔐</div>' +
-        "<h2>Mesa " + pad(n) + " já está em uso</h2>" +
+      var semCod = motivo === "semcodigo", off = motivo === "offline", saiu = motivo === "saiu";
+      g.innerHTML = '<div class="cc-box"><div style="font-size:2.2rem">' + (saiu ? "🧹" : "🔐") + "</div>" +
+        "<h2>" + (saiu ? "Mesa " + pad(n) + " sendo arrumada" : "Mesa " + pad(n) + " já está em uso") + "</h2>" +
         (off ? "<p>Sem conexão para confirmar a mesa. Conecte-se à internet e tente de novo.</p>"
+          : saiu ? "<p>O cliente anterior já saiu e o garçom vai arrumar a mesa. Aguarde ele liberar ou chame o garçom.</p>"
           : semCod ? "<p>Esta mesa já foi aberta pelo garçom. Peça a ele o <b>código da mesa</b> para continuar.</p>"
           : "<p>Para proteger a conta de quem está sentado, digite o <b>código de 4 dígitos</b> da mesa.<br>Ele está no celular de quem abriu a mesa — ou peça ao garçom.</p>") +
-        (off || semCod ? "" : '<input id="cc-pin-in" type="tel" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="••••"><div class="cc-err" id="cc-pin-err"></div><button class="cc-ok" id="cc-pin-go">Entrar na mesa</button>') +
+        (off || semCod || saiu ? "" : '<input id="cc-pin-in" type="tel" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="••••"><div class="cc-err" id="cc-pin-err"></div><button class="cc-ok" id="cc-pin-go">Entrar na mesa</button>') +
         (podeFechar !== false ? '<button class="cc-sec" id="cc-pin-no">Só ver o cardápio</button>' : "") + "</div>";
       document.body.appendChild(g);
       var inp = g.querySelector("#cc-pin-in"), err = g.querySelector("#cc-pin-err");
@@ -25711,23 +25811,28 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
         if (inp.value.length !== 4) { err.textContent = "Digite os 4 dígitos."; return; }
         go.disabled = true; err.textContent = "Conferindo…";
         var l = await lerMesa(n); go.disabled = false;
-        var pin = l.row && l.row.pin_sessao;
+        var raw = l.row && l.row.pin_sessao;
         if (l.erro) { err.textContent = "Sem conexão. Tente de novo."; return; }
-        if (!pin) { fechaGate(); resolve(true); return; }            // mesa foi liberada enquanto isso
-        if (inp.value === pin) { ls(K_OK + n, pin); ls(K_TENT + n, null); fechaGate(); chip(); resolve(true); return; }
+        if (!raw) { fechaGate(); resolve(true); return; }
+        if (pinOf(raw) === "SAIU") { fechaGate(); resolve(false); gate(n, "saiu", true); return; }
+        if (inp.value === pinOf(raw)) { ls(K_OK + n, raw); ls(K_TENT + n, null); alinharConta(n, raw); fechaGate(); chip(); resolve(true); return; }
         var t = errou(n); inp.value = "";
         err.textContent = t.ate ? "Muitas tentativas. Aguarde 5 min ou chame o garçom." : "Código incorreto. Restam " + (MAX_TENT - t.c) + " tentativa(s).";
       };
     });
   }
 
-  function avisoDono(n, pin) {
+  /* Janela do dono: código, WhatsApp e "Estou indo embora" */
+  function avisoDono(n, raw, titulo) {
     css(); fechaGate();
+    var pin = pinOf(raw);
     var g = document.createElement("div"); g.id = "cc-pin-gate";
-    g.innerHTML = '<div class="cc-box"><div style="font-size:2.2rem">✅</div><h2>Mesa ' + pad(n) + " é sua!</h2>" +
+    g.innerHTML = '<div class="cc-box"><div style="font-size:2.2rem">✅</div><h2>' + (titulo || "Mesa " + pad(n) + " é sua!") + "</h2>" +
       '<p>O código da sua mesa é</p><div style="font-size:2.6rem;font-weight:900;letter-spacing:.6rem;color:#ea580c;padding-left:.6rem">' + pin + "</div>" +
       "<p>Passe esse código <b>só para quem está sentado com você</b>. Quem não tiver o código não consegue pedir nem ver a conta da mesa.</p>" +
       '<button class="cc-ok" id="cc-pin-wa" style="background:#16a34a">📲 Enviar código pelo WhatsApp</button>' +
+      '<button class="cc-sec" id="cc-pin-lib">🚪 Estou indo embora</button>' +
+      '<div class="cc-err" id="cc-pin-msg" style="margin-top:6px"></div>' +
       '<button class="cc-sec" id="cc-pin-fim">Entendi</button></div>';
     document.body.appendChild(g);
     g.querySelector("#cc-pin-fim").onclick = fechaGate;
@@ -25737,48 +25842,97 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
       try { if (navigator.share) { navigator.share({ text: txt }).catch(function () {}); return; } } catch (e) {}
       window.open("https://wa.me/?text=" + encodeURIComponent(txt), "_blank");
     };
+    g.querySelector("#cc-pin-lib").onclick = async function () {
+      var msg = g.querySelector("#cc-pin-msg"); msg.textContent = "Conferindo a conta…";
+      var l = await lerMesa(n);
+      if (l.erro || !l.row) { msg.textContent = "Sem conexão. Tente de novo."; return; }
+      var atual = l.row.pin_sessao;
+      if (!atual || atual !== ls(K_OK + n)) { msg.textContent = "O código desta mesa mudou. Fale com o garçom."; return; }
+      var c = await contaAberta(n, iniOf(atual));
+      if (c.erro) { msg.textContent = "Sem conexão para conferir a conta. Tente de novo."; return; }
+      if (c.soma > 0.009) {
+        sincronizarSaldo(n);   // mantém "Minha Conta"/Pix igual à conta rigorosa (inclui entregues não pagos)
+        msg.innerHTML = "Ainda há <b>" + brl(c.soma) + "</b> em aberto (" + c.qtd + " pedido" + (c.qtd > 1 ? "s" : "") + " não pago" + (c.qtd > 1 ? "s" : "") + "). Pague para poder sair.";
+        if (!g.querySelector("#cc-pin-conta")) {
+          var b = document.createElement("button"); b.className = "cc-ok"; b.id = "cc-pin-conta"; b.textContent = "💳 Ir para Minha Conta";
+          b.onclick = function () { fechaGate(); try { alternarOpcaoMesa("conta"); } catch (e) {} };
+          msg.insertAdjacentElement("afterend", b);
+        }
+        return;
+      }
+      if (!confirm("Confirmar que você está indo embora da Mesa " + pad(n) + "?\n\nSeu código será desativado e o garçom será avisado para arrumar a mesa. Para pedir de novo aqui, será preciso o garçom liberar a mesa.")) { msg.textContent = ""; return; }
+      var c2 = await contaAberta(n, iniOf(atual));
+      if (c2.erro || c2.soma > 0.009) { msg.textContent = c2.erro ? "Sem conexão para conferir a conta. Tente de novo." : "A conta mudou. Confira em Minha Conta antes de sair."; return; }
+      msg.textContent = "Encerrando…";
+      var r = await sb().from("mesas").update({ pin_sessao: "SAIU@" + iniOf(atual) }).eq("empresa_id", emp()).eq("numero", n).eq("pin_sessao", atual).select("numero");
+      if (!r || r.error || !r.data || !r.data.length) { msg.textContent = "Não foi possível encerrar agora. Tente de novo."; return; }
+      ls(K_OK + n, null);
+      if (!l.row.status || l.row.status === "livre") marcarOcupada(n);   // sair NÃO libera a mesa: só o garçom
+      var ch = document.getElementById("cc-pin-chip"); if (ch) ch.remove();
+      g.querySelector(".cc-box").innerHTML = '<div style="font-size:2.4rem">👋</div><h2>Obrigado pela visita!</h2><p>Seu código foi desativado e o garçom vai arrumar a mesa. Volte sempre! 🌴</p><button class="cc-ok" id="cc-pin-x">Fechar</button>';
+      g.querySelector("#cc-pin-x").onclick = fechaGate;
+    };
   }
 
-  /* Selo fixo "Código da mesa" nos celulares autorizados */
+  /* Selo fixo com o código, só nos celulares autorizados */
   async function chip() {
     if (!cliente()) return;
     var n = mesaAtual(), el = document.getElementById("cc-pin-chip");
     if (!n || !emp()) { if (el) el.remove(); return; }
-    var l = await lerMesa(n), pin = l.row && l.row.pin_sessao;
-    if (l.erro || !pin || ls(K_OK + n) !== pin) { if (el) el.remove(); return; }
+    var l = await lerMesa(n), raw = l.row && l.row.pin_sessao;
+    if (l.erro || !raw || pinOf(raw) === "SAIU" || ls(K_OK + n) !== raw) { if (el) el.remove(); return; }
     css();
-    if (!el) { el = document.createElement("div"); el.id = "cc-pin-chip"; el.onclick = function () { avisoDono(mesaAtual(), ls(K_OK + mesaAtual())); }; document.body.appendChild(el); }
-    el.innerHTML = "🔐 Mesa " + pad(n) + " · código <b>" + pin + "</b>";
+    if (!el) { el = document.createElement("div"); el.id = "cc-pin-chip"; el.onclick = function () { var m = mesaAtual(); avisoDono(m, ls(K_OK + m), "Mesa " + pad(m)); }; document.body.appendChild(el); }
+    el.innerHTML = "🔐 Mesa " + pad(n) + " · código <b>" + pinOf(raw) + "</b>";
   }
 
   /* Núcleo: libera a ação ou pede o código. Resolve true/false. */
-  async function protegido(n, pedido) {
+  async function protegido(n) {
     if (ocupado) return false; ocupado = true;
     try {
-      /* Pedido PRÉ-PAGO (praia/híbrido ou "pagar agora"): só vai à cozinha depois do Pix confirmado e NÃO entra na conta da mesa.
-         Quem pede paga o próprio pedido, então não há conta de terceiro a proteger: sem código, sem atrito. */
-      /* O código vale em TODAS as mesas (salão e praia), pré-pago ou não. */
       var a = await garantirAcesso(n);
-      if (a.ok) { if (a.novo) { chip(); avisoDono(n, a.pin); } return true; }
+      if (a.ok) { if (a.novo) { chip(); avisoDono(n, a.raw); } return true; }
       return await gate(n, a.motivo, true);
-    } catch (e) { console.warn("[Código da mesa]", e && e.message); return true; }   // falha inesperada nunca trava o restaurante
+    } catch (e) { console.warn("[Código da mesa]", e && e.message); return true; }
     finally { ocupado = false; }
   }
 
-  /* Envolve as ações do cliente: pedir, pagar, chamar garçom */
-  function envolver(nome, pedido) {
+  /* Ações do cliente protegidas: pedir, pagar, chamar garçom */
+  function envolver(nome, extra) {
     var orig = window[nome];
     if (typeof orig !== "function" || orig.__ccpin) return;
     var w = function () {
       var self = this, args = arguments;
       if (equipe()) return orig.apply(self, args);
       var n = mesaAtual(); if (!n) return orig.apply(self, args);
-      return protegido(n, pedido).then(function (ok) { if (ok) return orig.apply(self, args); });
+      return protegido(n).then(function (ok) {
+        if (!ok) return;
+        var pre = false, t0 = Date.now() - 2000;
+        try { pre = typeof ccRequerPrePago === "function" && !!ccRequerPrePago(n); } catch (e) {}
+        var r = orig.apply(self, args);
+        if (extra === "pedido") Promise.resolve(r).then(function () { setTimeout(function () { marcarPre(n, pre, t0); sincronizarSaldo(n); }, 1500); });
+        return r;
+      });
     };
     w.__ccpin = true; window[nome] = w;
   }
+  /* Depois do Pix confirmado: baixa os pedidos pagos e ajusta o saldo */
+  function envolverPix() {
+    var o = window.ccFecharContaCliente; if (typeof o !== "function" || o.__ccpin) return;
+    var w = function (mesa, valor) {
+      var r = o.apply(this, arguments);
+      try { var n = Number(mesa); marcarPagosPix(n, valor).then(function () { setTimeout(function () { sincronizarSaldo(n); }, 2000); }); } catch (e) {}
+      return r;
+    };
+    w.__ccpin = true; window.ccFecharContaCliente = w;
+  }
+  function envolverAbater() {
+    var o = window.ccAbaterSaldoMesa; if (typeof o !== "function" || o.__ccpin) return;
+    var w = function (mesa) { var r = o.apply(this, arguments); try { var n = Number(mesa); setTimeout(function () { sincronizarSaldo(n); }, 1500); } catch (e) {} return r; };
+    w.__ccpin = true; window.ccAbaterSaldoMesa = w;
+  }
 
-  /* Mesa liberada => apaga o código. Equipe abrindo mesa => garante que ela tenha código. */
+  /* Garçom liberou a mesa (fluxo que já existe) => apaga o código. Equipe abrindo mesa => garante código. */
   async function limpar(n) {
     try {
       if (!emp()) return;
@@ -25801,15 +25955,16 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
     wSet.__ccpin = true; window.ccSetMesaStatus = wSet;
   }
 
-  /* Painel da equipe: código em cada cartão de mesa + Trocar/Gerar */
+  /* ─── Painel da equipe ─── */
   window.ccPinMesaEquipe = async function (n, acao) {
     n = Number(n);
     if (acao === "trocar" && !confirm("Trocar o código da Mesa " + pad(n) + "?\n\nQuem já está na mesa (inclusive o dono) precisará digitar o código novo. Use se alguém de fora conseguiu entrar.")) return;
-    var pin = novoPin();
-    var r = await sb().from("mesas").update({ pin_sessao: pin }).eq("empresa_id", emp()).eq("numero", n).select("numero");
+    var l = await lerMesa(n), antigo = l.row && l.row.pin_sessao, ini = iniOf(antigo) || Date.now();
+    var raw = novoRaw(novoPin(), ini);
+    var r = await sb().from("mesas").update({ pin_sessao: raw }).eq("empresa_id", emp()).eq("numero", n).select("numero");
     if (r && r.error) { aviso("❌ Não foi possível gerar o código: " + (r.error.message || "erro")); return; }
-    if (!r.data || !r.data.length) { var i = await sb().from("mesas").insert({ empresa_id: emp(), numero: n, status: "livre", total: 0, pin_sessao: pin }); if (i && i.error) { aviso("❌ " + (i.error.message || "erro")); return; } }
-    aviso("🔐 Mesa " + pad(n) + ": novo código " + pin);
+    if (!r.data || !r.data.length) { var i = await sb().from("mesas").insert({ empresa_id: emp(), numero: n, status: "livre", total: 0, pin_sessao: raw }); if (i && i.error) { aviso("❌ " + (i.error.message || "erro")); return; } }
+    aviso("🔐 Mesa " + pad(n) + ": novo código " + pinOf(raw));
     decorarEquipe();
   };
   async function decorarEquipe() {
@@ -25825,8 +25980,9 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
         var n = parseInt(m[1], 10), x = mapa[n] || {};
         var old = card.querySelector(".cc-pin-linha"); if (old) old.remove();
         var html;
-        if (x.pin_sessao) html = '<span>🔐 Código da mesa: <b>' + x.pin_sessao + '</b></span><button onclick="ccPinMesaEquipe(' + n + ',\'trocar\')">🔄 Trocar</button>';
-        else if (x.status && x.status !== "livre") html = '<span>🔐 Mesa sem código (aberta antes da proteção)</span><button onclick="ccPinMesaEquipe(' + n + ',\'gerar\')">Gerar código</button>';
+        if (x.pin_sessao && pinOf(x.pin_sessao) === "SAIU") html = "<span>🧹 Cliente saiu — arrume a mesa e libere</span>";
+        else if (x.pin_sessao) html = '<span>🔐 Código da mesa: <b>' + pinOf(x.pin_sessao) + '</b></span><button onclick="ccPinMesaEquipe(' + n + ',\'trocar\')">🔄 Trocar</button>';
+        else if (x.status && x.status !== "livre") html = '<span>🔐 Mesa sem código</span><button onclick="ccPinMesaEquipe(' + n + ',\'gerar\')">Gerar código</button>';
         else return;
         card.insertAdjacentHTML("beforeend", '<div class="cc-pin-linha">' + html + "</div>");
       });
@@ -25839,23 +25995,90 @@ body #items-wrap .img-box img.card-img.cc-contain{object-fit:contain!important;b
   }
   setInterval(function () { if (equipe() && !document.hidden) decorarEquipe(); }, 15000);
 
-  /* Envolve as ações (depois que todos os outros scripts já definiram as funções) */
-  function aplicar() { envolver("enviarPedido", true); envolver("ccClientePagarPix"); envolver("ccChamarGarcomCartao"); }
+  /* Equipe: quando outro aparelho libera a mesa, este reinicia a conta daquela mesa (igual à liberação manual) */
+  var vistoStatus = {};
+  async function vigiarLiberacoes() {
+    try {
+      if (!equipe() || !emp() || semColuna || typeof mesaSessaoInicio === "undefined") return;
+      var r = await sb().from("mesas").select("numero,status").eq("empresa_id", emp());
+      if (r.error || !r.data) return;
+      var mudou = false;
+      r.data.forEach(function (x) {
+        var n = Number(x.numero), ant = vistoStatus[n];
+        if (ant && ant !== "livre" && x.status === "livre") { mesaSessaoInicio[n] = new Date().toISOString(); mudou = true; }
+        vistoStatus[n] = x.status;
+      });
+      if (mudou) salvar("mesaSessaoInicio", mesaSessaoInicio);
+    } catch (e) {}
+  }
+  setTimeout(vigiarLiberacoes, 3000); setInterval(vigiarLiberacoes, 10000);
+
+  /* Equipe: a cada 5 min libera sozinha as mesas abandonadas (ocupadas, sem nenhum pedido, além do prazo) */
+  async function varrerOciosas() {
+    try {
+      if (!equipe() || !emp() || semColuna || typeof ccSetMesaStatus !== "function") return;
+      var r = await sb().from("mesas").select("numero,status,pin_sessao").eq("empresa_id", emp());
+      if (r.error || !r.data) return;
+      for (var i = 0; i < r.data.length; i++) {
+        var x = r.data[i];
+        if (!(await mesaOciosa(x))) continue;
+        var c = await lerMesa(Number(x.numero));                     // confere de novo: nada mudou nesse meio tempo
+        if (c.row && c.row.pin_sessao === x.pin_sessao && c.row.status === x.status) ccSetMesaStatus(Number(x.numero), "livre", 0);
+      }
+    } catch (e) {}
+  }
+  setTimeout(varrerOciosas, 20000); setInterval(varrerOciosas, 5 * 60 * 1000);
+
+  function aplicar() { envolver("enviarPedido", "pedido"); envolver("ccClientePagarPix"); envolver("ccChamarGarcomCartao"); envolverPix(); envolverAbater(); }
   aplicar(); setTimeout(aplicar, 1500); setTimeout(aplicar, 6000);
 
-  /* Ao abrir pelo QR: se a mesa já tem dono e este celular não sabe o código, pede já (dá pra fechar e só ver o cardápio) */
-  function aoAbrir() {
+  /* ─── Ao ESCANEAR o QR (celular de cliente): abre a mesa na hora ─── */
+  async function aoAbrir() {
     if (!cliente()) return;
-    var n = mesaAtual(); if (!n || !emp()) return;
-    lerMesa(n).then(function (l) {
-      if (semColuna || l.erro || !l.row || !l.row.pin_sessao) return;
-      if (ls(K_OK + n) === l.row.pin_sessao) { chip(); return; }
-      ls(K_OK + n, null);
-      gate(n, "pin", true);
-    });
+    var n = mesaAtual(); if (!n || !emp() || ocupado) return;
+    ocupado = true;
+    try {
+      var l = await lerMesa(n);
+      if (semColuna || l.erro) return;
+      var raw = l.row && l.row.pin_sessao, st = (l.row && l.row.status) || "livre";
+      if (raw && ls(K_OK + n) !== raw && await mesaOciosa(l.row)) {      // mesa abandonada: este celular assume
+        var pa = await reivindicar(n, raw);
+        if (pa) { ls(K_OK + n, pa); alinharConta(n, pa); marcarOcupada(n); chip(); ocupado = false; avisoDono(n, pa); return; }
+      }
+      if (raw && st === "livre" && ls(K_OK + n) !== raw) {          // sobra de sessão antiga numa mesa que o garçom já deixou LIVRE: este celular abre a mesa
+        var pl = await reivindicar(n, raw);
+        if (pl) { ls(K_OK + n, pl); alinharConta(n, pl); marcarOcupada(n); chip(); ocupado = false; avisoDono(n, pl); return; }
+      }
+      if (raw) {
+        if (ls(K_OK + n) === raw) { if (st === "livre" && pinOf(raw) !== "SAIU") marcarOcupada(n); alinharConta(n, raw); chip(); return; }
+        ls(K_OK + n, null); ocupado = false;
+        gate(n, pinOf(raw) === "SAIU" ? "saiu" : "pin", true); return;
+      }
+      if (st !== "livre") { ocupado = false; gate(n, "semcodigo", true); return; }
+      var novo = await reivindicar(n, null);                    // mesa livre: este celular abre a mesa agora
+      if (novo) { ls(K_OK + n, novo); alinharConta(n, novo); marcarOcupada(n); chip(); ocupado = false; avisoDono(n, novo); return; }
+      ocupado = false; gate(n, "pin", true);                    // outro celular abriu primeiro
+    } catch (e) { console.warn("[Código da mesa]", e && e.message); }
+    finally { ocupado = false; }
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { setTimeout(aoAbrir, 1800); });
   else setTimeout(aoAbrir, 1800);
+  /* Garante a abertura mesmo se a rede/nuvem demorar: tenta de novo (até 8x) e quando a nuvem ficar pronta */
+  var _tentAbrir = 0, _tmAbrir = null;
+  async function aoAbrirGarantido() {
+    clearTimeout(_tmAbrir);
+    try {
+      if (_gateVisto || !cliente()) return;
+      var n = mesaAtual(); if (!n) return;
+      await aoAbrir();
+      if (_gateVisto || semColuna) return;
+      var l = await lerMesa(n), raw = l.row && l.row.pin_sessao;
+      if (!l.erro && raw && ls(K_OK + n) === raw) return;          // mesa aberta neste celular
+    } catch (e) {}
+    if (++_tentAbrir < 8) _tmAbrir = setTimeout(aoAbrirGarantido, 3000);
+  }
+  setTimeout(aoAbrirGarantido, 4500);
+  window.addEventListener("cc:nuvem-pronta", function () { setTimeout(aoAbrirGarantido, 700); });
   document.addEventListener("visibilitychange", function () { if (!document.hidden && cliente()) chip(); });
   setInterval(function () { if (cliente() && !document.hidden) chip(); }, 30000);
 })();
@@ -26143,3 +26366,211 @@ body.cc-modo-cliente #cc-btn-voltar-painel,#cc-btn-voltar-painel{top:calc(env(sa
   }
 }
 </style>
+<style id="cc-fix-mobile-2026-11">
+/* ═══════════════════════════════════════════════════════════════════════════
+   AJUSTE MOBILE FINAL (22/11/2026) — último bloco do arquivo, só apresentação.
+   1) Safe areas (iOS/Android) em TODO elemento fixo: topo, rodapé e laterais.
+   2) Bandeiras x logo x botão "Voltar": nada se sobrepõe, em qualquer largura.
+   3) Abas de categorias: 5 na mesma linha (carrossel só se a tela for minúscula).
+   4) Lista de produtos: o rodapé laranja nunca cobre o último card.
+   5) Linha de informações do card (porção etc.) quebra linha em vez de cortar.
+   ═══════════════════════════════════════════════════════════════════════════ */
+:root{
+  --sat:env(safe-area-inset-top,0px);
+  --sab:env(safe-area-inset-bottom,0px);
+  --sal:env(safe-area-inset-left,0px);
+  --sar:env(safe-area-inset-right,0px);
+  --cc-rodape-h:calc(84px + var(--sab));   /* medido por JS (rodapé laranja) */
+  --cc-nav-h:calc(68px + var(--sab));      /* medido por JS (abas inferiores) */
+}
+html{scroll-padding-top:calc(var(--sat) + 72px);scroll-padding-bottom:calc(var(--cc-rodape-h) + 16px)}
+
+/* ── 2a) Seletor de idiomas: compacto e sempre abaixo da barra de status ── */
+html body #cc-lang-bar{
+  top:calc(var(--sat) + 8px)!important;right:calc(var(--sar) + 8px)!important;
+  gap:4px!important;padding:4px 6px!important;max-width:calc(100vw - 16px)!important;box-sizing:border-box!important}
+html body #cc-lang-bar button{width:30px!important;height:22px!important;flex:0 0 auto!important;touch-action:manipulation}
+@media(max-width:340px){html body #cc-lang-bar button{width:26px!important;height:19px!important}}
+
+/* Telas internas (lista de produtos, "Voltar para o Painel"): só a bandeira ativa,
+   toque para abrir as demais. Libera a barra de cima para Voltar + busca. */
+html body.cc-cardapio-full #cc-lang-bar:not(.cc-open){gap:0!important;padding:4px 7px!important}
+html body.cc-cardapio-full #cc-lang-bar:not(.cc-open) button:not(.on){display:none!important}
+html body:has(#cc-btn-voltar-painel:not(.hidden)) #cc-lang-bar:not(.cc-open){gap:0!important;padding:4px 7px!important}
+html body:has(#cc-btn-voltar-painel:not(.hidden)) #cc-lang-bar:not(.cc-open) button:not(.on){display:none!important}
+html body #cc-lang-bar.cc-open{box-shadow:0 8px 26px rgba(0,0,0,.5)!important}
+
+/* ── 2b) Logo no canto SUPERIOR ESQUERDO do banner (as bandeiras ficam à direita) ── */
+html body #cc-topo-banner-btn .cc-topo-logo{
+  left:calc(var(--sal) + 10px)!important;right:auto!important;top:8px!important;
+  width:44px!important;height:44px!important;border-width:2px!important}
+
+/* ── 2c) Botão "Voltar para o Painel": abaixo da barra de status, nunca cortado ── */
+html body.cc-modo-cliente #cc-btn-voltar-painel,
+html body #cc-btn-voltar-painel{
+  top:calc(var(--sat) + 8px)!important;left:calc(var(--sal) + 8px)!important;
+  height:38px!important;line-height:38px!important;padding:0 14px!important;
+  max-width:calc(100vw - var(--sal) - var(--sar) - 84px)!important;
+  overflow:hidden!important;text-overflow:ellipsis!important;white-space:nowrap!important;
+  z-index:1000!important;box-sizing:border-box!important}
+/* o conteúdo desce a altura da barra de status + do botão (antes: 56px fixos) */
+html body:has(#cc-btn-voltar-painel:not(.hidden)) [id^="view-"]:not(#view-cozinha):not(#view-mesa-cliente){
+  padding-top:calc(var(--sat) + 60px)!important}
+html body:has(#cc-btn-voltar-painel:not(.hidden)) #view-cozinha .kds-topbar{
+  padding-top:calc(var(--sat) + 58px)!important}
+
+/* ── 3) Abas de categorias: 5 na mesma linha ── */
+html body.cc-modo-cliente:not(.cc-cardapio-full) #conteudo-secao-mesa #cat-nav{
+  display:grid!important;grid-auto-flow:column!important;
+  grid-template-columns:none!important;grid-auto-columns:minmax(56px,1fr)!important;
+  gap:6px!important;padding:2px max(8px,var(--sar)) 6px max(8px,var(--sal))!important;
+  overflow-x:auto!important;overflow-y:hidden!important;overscroll-behavior-x:contain;
+  scroll-snap-type:x proximity;-webkit-overflow-scrolling:touch;scrollbar-width:none;box-sizing:border-box!important;width:100%!important}
+html body.cc-modo-cliente:not(.cc-cardapio-full) #conteudo-secao-mesa #cat-nav::-webkit-scrollbar{display:none}
+html body.cc-modo-cliente:not(.cc-cardapio-full) #conteudo-secao-mesa #cat-nav .cat-photo-card{
+  scroll-snap-align:start;aspect-ratio:1/1.12!important;padding:0 2px 7px!important;border-radius:14px!important;min-width:0!important}
+html body.cc-modo-cliente:not(.cc-cardapio-full) #conteudo-secao-mesa #cat-nav .cat-photo-label{
+  display:block!important;width:100%!important;min-height:0!important;white-space:nowrap!important;overflow:hidden!important;
+  text-overflow:clip!important;text-transform:none!important;letter-spacing:0!important;font-weight:800!important;
+  font-size:clamp(.6rem,2.9vw,.74rem);line-height:1.2!important;text-align:center!important;word-break:normal!important;overflow-wrap:normal!important}
+html body.cc-modo-cliente:not(.cc-cardapio-full) #cc-cat-nav-wrap{padding-left:0!important;padding-right:0!important;max-width:900px!important}
+
+/* ── 4) Lista de produtos (tela cheia): topo e rodapé respeitam as safe areas ── */
+html body.cc-cardapio-full #cc-full-topo{
+  padding:calc(var(--sat) + 8px) calc(var(--sar) + 62px) 8px calc(var(--sal) + 10px)!important;
+  gap:8px!important;box-sizing:border-box!important}
+html body.cc-cardapio-full #cc-full-voltar{
+  flex:0 0 auto!important;max-width:44%!important;min-height:42px!important;overflow:hidden!important;
+  text-overflow:ellipsis!important;white-space:nowrap!important}
+html body.cc-cardapio-full #cc-full-busca{min-width:0!important;min-height:42px!important;font-size:16px!important}
+html body.cc-cardapio-full.cc-modo-cliente #conteudo-secao-mesa{
+  padding-top:calc(var(--sat) + 70px)!important;
+  padding-bottom:calc(var(--cc-rodape-h) + 16px)!important;
+  padding-left:max(12px,var(--sal))!important;padding-right:max(12px,var(--sar))!important;
+  margin-top:0!important;min-height:100vh!important}
+html body.cc-cardapio-full #cc-full-rodape{
+  padding:12px calc(var(--sar) + 14px) calc(12px + var(--sab)) calc(var(--sal) + 14px)!important;
+  gap:10px!important;box-sizing:border-box!important;left:0!important;right:0!important;bottom:0!important}
+html body.cc-cardapio-full #cc-full-total-wrap{min-width:0!important;flex:1 1 auto!important}
+html body.cc-cardapio-full #cc-full-total{font-size:clamp(1.05rem,5.4vw,1.35rem)!important;white-space:nowrap!important}
+html body.cc-cardapio-full #cc-full-confirmar{
+  flex:0 1 auto!important;min-width:0!important;white-space:nowrap!important;
+  padding:13px 16px!important;font-size:clamp(.82rem,3.8vw,.95rem)!important}
+
+/* mesma proteção na capa: o último bloco nunca fica sob as abas inferiores */
+html body.cc-modo-cliente:not(.cc-cardapio-full) #conteudo-secao-mesa{
+  padding-bottom:calc(var(--cc-nav-h) + 28px)!important}
+html body #cc-nav-publica{bottom:0!important;padding:6px max(6px,var(--sar)) calc(6px + var(--sab)) max(6px,var(--sal))!important;box-sizing:border-box!important}
+html body #cc-fab-chamar-garcom{right:calc(var(--sar) + 16px)!important;bottom:calc(var(--cc-nav-h) + 12px)!important}
+
+/* ── 5) Card do produto: informações abaixo da descrição não cortam ── */
+html body #items-wrap .card{height:auto!important;min-width:0!important}
+html body #items-wrap .card .p-3{min-width:0!important;overflow:visible!important}
+html body #items-wrap .card .p-3 > div[style*="display:flex"]{flex-wrap:wrap!important;gap:4px!important}
+html body #items-wrap .card .tag,
+html body.cc-modo-cliente #items-wrap .card .tag{
+  white-space:normal!important;height:auto!important;max-width:100%!important;min-width:0!important;
+  line-height:1.3!important;overflow:visible!important;
+  align-items:flex-start!important;text-align:left!important}
+
+/* ── Sino: deixa de flutuar sobre o conteúdo (cobria o banner de promoção) e passa a
+      ocupar a ponta direita da barra inferior. O botão é o MESMO (mesmos eventos). ── */
+html body.cc-modo-cliente #cc-nav-publica{bottom:0!important}
+html body #cc-nav-publica{grid-auto-flow:column!important;grid-auto-columns:auto!important}
+html body #cc-nav-publica #cc-fab-chamar-garcom{
+  position:static!important;right:auto!important;left:auto!important;bottom:auto!important;top:auto!important;
+  width:46px!important;height:46px!important;min-width:46px!important;padding:0!important;margin:0 2px 0 4px!important;
+  align-self:center!important;justify-self:center!important;transform:none;border-radius:999px!important;
+  background:#dc2626!important;color:#fff!important;display:flex!important;align-items:center!important;justify-content:center!important;
+  box-shadow:0 3px 10px rgba(220,38,38,.35)!important}
+html body #cc-nav-publica #cc-fab-chamar-garcom span{display:block!important;font-size:1.35rem!important;line-height:1!important;margin:0!important}
+/* ── Campo da mesa com rótulo sempre visível ── */
+html body #cc-slot-mesa-cliente{position:relative!important}
+html body .cc-lbl-mesa{position:absolute;top:-5px;left:calc(1rem + 12px);z-index:3;background:#fff;padding:0 5px;
+  font-size:.6rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:#ea580c;line-height:1.1;pointer-events:none}
+</style>
+<script id="cc-fix-mobile-2026-11-js">
+(function(){
+  'use strict';
+  var d=document,root=d.documentElement;
+  function $(s,r){return (r||d).querySelector(s)}
+  function $$(s,r){return Array.prototype.slice.call((r||d).querySelectorAll(s))}
+  function raf(fn){return window.requestAnimationFrame?requestAnimationFrame(fn):setTimeout(fn,16)}
+
+  /* ── Medidas reais do rodapé laranja e das abas inferiores (variam com idioma/aparelho) ── */
+  function medir(){
+    try{
+      var r=$('#cc-full-rodape'),n=$('#cc-nav-publica');
+      if(r&&r.offsetHeight)root.style.setProperty('--cc-rodape-h',r.offsetHeight+'px');
+      if(n&&n.offsetHeight)root.style.setProperty('--cc-nav-h',n.offsetHeight+'px');
+    }catch(e){}
+  }
+  var ro=null;
+  function observarMedidas(){
+    medir();
+    if(!window.ResizeObserver){return}
+    if(!ro)ro=new ResizeObserver(function(){raf(medir)});
+    ['#cc-full-rodape','#cc-nav-publica'].forEach(function(s){var el=$(s);if(el&&!el.__ccRo){el.__ccRo=1;ro.observe(el)}});
+  }
+
+  var fitAgendado=false;
+  function ajustarAbas(){
+    fitAgendado=false;
+    var labs=$$('#cat-nav .cat-photo-label');if(!labs.length)return;
+    /* mesmo tamanho de fonte nas abas, o maior que cabe sem cortar nenhuma */
+    labs.forEach(function(el){el.style.removeProperty('font-size')});
+    var fs=parseFloat(getComputedStyle(labs[0]).fontSize)||11,min=fs;
+    labs.forEach(function(el){
+      var f=parseFloat(getComputedStyle(el).fontSize)||fs,guard=0;
+      while(el.scrollWidth>el.clientWidth+0.5&&f>7&&guard++<30){f-=0.25;el.style.setProperty('font-size',f+'px','important')}
+      if(f<min)min=f;
+    });
+    labs.forEach(function(el){el.style.setProperty('font-size',min+'px','important')});
+  }
+  function agendarAbas(){if(fitAgendado)return;fitAgendado=true;raf(ajustarAbas)}
+
+  /* ── Seletor de idiomas compacto em telas internas: toque na bandeira abre as demais ── */
+  function ligarIdiomas(){
+    var b=$('#cc-lang-bar');if(!b||b.__ccFix)return;b.__ccFix=1;
+    function recolhido(){var o=$('button:not(.on)',b);return !!o&&getComputedStyle(o).display==='none'}
+    function fechar(){b.classList.remove('cc-open')}
+    var t=null;
+    b.addEventListener('click',function(ev){
+      var btn=ev.target.closest&&ev.target.closest('button');if(!btn)return;
+      if(!b.classList.contains('cc-open')&&recolhido()){
+        ev.preventDefault();ev.stopImmediatePropagation();
+        b.classList.add('cc-open');clearTimeout(t);t=setTimeout(fechar,5000);
+      }else{fechar()}
+    },true);
+    d.addEventListener('click',function(ev){if(b.classList.contains('cc-open')&&!b.contains(ev.target))fechar()},true);
+  }
+
+
+  /* ── Rótulo "Nº da mesa" e sino dentro da barra inferior (só mexe de lugar; lógica intacta) ── */
+  function rotuloMesa(){
+    var s=$('#cc-slot-mesa-cliente');if(!s||s.querySelector('.cc-lbl-mesa'))return;
+    var l=d.createElement('label');l.className='cc-lbl-mesa';l.setAttribute('for','cc-ident-input-cliente');
+    l.textContent='Nº da mesa';s.insertBefore(l,s.firstChild);
+  }
+  function moverSino(){
+    var f=$('#cc-fab-chamar-garcom'),n=$('#cc-nav-publica');
+    if(!f||!n)return;
+    if(f.parentNode!==n||n.lastElementChild!==f)n.appendChild(f);   /* sempre por último (depois do "Hotel", se existir) */
+    if(!n.__ccMoSino&&window.MutationObserver){n.__ccMoSino=1;
+      new MutationObserver(function(){if(n.lastElementChild!==f)n.appendChild(f)}).observe(n,{childList:true})}
+  }
+
+  /* ── Liga tudo; observa só o que importa (nav de categorias e lista de itens) ── */
+  function ligar(){
+    observarMedidas();ligarIdiomas();rotuloMesa();moverSino();ajustarAbas();
+    var nav=$('#cat-nav');
+    if(nav&&!nav.__ccMo&&window.MutationObserver){nav.__ccMo=1;new MutationObserver(agendarAbas).observe(nav,{childList:true})}
+  }
+  var tentativas=0;
+  (function ciclo(){ligar();if(++tentativas<8)setTimeout(ciclo,tentativas<4?500:2000)})();
+  window.addEventListener('resize',function(){agendarAbas();medir()},{passive:true});
+  window.addEventListener('orientationchange',function(){setTimeout(function(){agendarAbas();medir()},300)});
+  window.addEventListener('load',function(){ligar();if(d.fonts&&d.fonts.ready)d.fonts.ready.then(agendarAbas)});
+  d.addEventListener('click',function(){setTimeout(function(){medir();agendarAbas()},250)},true);
+})();
+</script>
